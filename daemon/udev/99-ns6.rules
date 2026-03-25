@@ -1,0 +1,7 @@
+# Numark NS6 — udev rules
+# Permite acesso ao dispositivo sem root
+# Instalar em: /etc/udev/rules.d/99-ns6.rules
+# Recarregar: sudo udevadm control --reload && sudo udevadm trigger
+
+SUBSYSTEM=="usb", ATTRS{idVendor}=="15e4", ATTRS{idProduct}=="0079", \
+    MODE="0664", GROUP="audio", TAG+="uaccess"

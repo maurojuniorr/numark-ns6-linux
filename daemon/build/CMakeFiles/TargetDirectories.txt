@@ -1,0 +1,3 @@
+/home/joaobatista/Documentos/Numark NS6 Daemon/build/CMakeFiles/ns6d.dir
+/home/joaobatista/Documentos/Numark NS6 Daemon/build/CMakeFiles/edit_cache.dir
+/home/joaobatista/Documentos/Numark NS6 Daemon/build/CMakeFiles/rebuild_cache.dir
