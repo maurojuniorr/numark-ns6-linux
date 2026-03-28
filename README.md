@@ -1,6 +1,3 @@
-Parabéns por chegar nos 98%! É um marco histórico tirar um driver de áudio isócrono do papel. Como estamos falando de um **driver de kernel (módulo `.ko`)** e não apenas de um mapeamento de software, o README precisa refletir essa "responsa".
-
-Aqui está uma proposta de README robusta, técnica e organizada para o seu novo repositório `kmod-total`:
 
 ---
 
