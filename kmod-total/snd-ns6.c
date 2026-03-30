@@ -33,7 +33,7 @@
 #define NS6_PKTS_PER_URB    32
 #define NS6_PKT_SIZE        72   
 #define NS6_URB_BYTES       (NS6_PKTS_PER_URB * NS6_PKT_SIZE)  
-#define NS6_NURBS           2
+#define NS6_NURBS           6
 
 /* MIDI */
 #define NS6_MIDI_PKT_SIZE   42
@@ -54,8 +54,8 @@ struct ns6_stream {
     unsigned int              phase; 
     bool                      active_usb; /* Mantém o cabo vivo enviando silêncio */
     bool                      active_pcm; /* Libera o áudio real da música */
-    
-
+    int                       warmup_cnt; /* ADICIONE ESTA LINHA */
+    unsigned int              log_counter; /* ADICIONE ESTE ESPIÃO AQUI */
 };
 
 struct ns6 {
@@ -173,9 +173,10 @@ static void ns6_play_urb_cb(struct urb *urb) {
     spin_lock_irqsave(&s->lock, flags);
     sub = s->substream;
 
-    /* Verifica se devemos mandar silêncio (deck pausado ou descarregado) */
-    if (!s->active_pcm || !sub || !snd_pcm_running(sub) || !sub->runtime->dma_area) {
+    /* Se estiver no aquecimento ou pausado, fill_silence = true */
+    if (s->warmup_cnt > 0 || !s->active_pcm || !sub || !snd_pcm_running(sub)) {
         fill_silence = true;
+        if (s->warmup_cnt > 0) s->warmup_cnt--;
     }
 
     /* 1. SEMPRE RODA A MATEMÁTICA DO RELÓGIO (Mesmo no silêncio absoluto!)
@@ -225,6 +226,25 @@ static void ns6_play_urb_cb(struct urb *urb) {
     /* Só avisa o Mixxx que o tempo passou se a música estiver rodando */
     if (elapsed && !fill_silence) snd_pcm_period_elapsed(sub);
 
+/* ==================================================================== *
+     * SISTEMA DE TELEMETRIA AO VIVO CORRIGIDO (MONITOR DE DRIFT)
+     * ==================================================================== */
+    if (!fill_silence && sub && sub->runtime) {
+        s->log_counter++;
+        /* Dispara o log a cada ~1 segundo */
+        if (s->log_counter >= 100) {
+            s->log_counter = 0;
+            
+            /* Agora sim, os dois ponteiros são absolutos e alinhados! */
+            snd_pcm_uframes_t appl = sub->runtime->control->appl_ptr;
+            snd_pcm_uframes_t hw = sub->runtime->status->hw_ptr;
+            long delay = appl - hw;
+            
+            pr_info("NS6 TELEMETRIA: PC=%lu | Placa=%lu | Tanque Real: %ld / %lu\n",
+                    (unsigned long)appl, (unsigned long)hw, delay, 
+                    (unsigned long)sub->runtime->buffer_size);
+        }
+    }
     if (s->active_usb) usb_submit_urb(urb, GFP_ATOMIC);
 }
 
@@ -265,22 +285,27 @@ static void ns6_midi_out_urb_cb(struct urb *urb);
 static void ns6_process_midi_out(struct ns6 *ns6) {
     uint8_t byte;
     int err;
+    unsigned long flags; /* ADICIONADO PARA O CADEADO INTERNO */
 
-    if (!ns6->ep_midi_out || !ns6->midi_out_sub) {
-        ns6->midi_out_busy = false;
+    /* Bloqueia a porta para ninguém entrar enquanto o robô pensa */
+    spin_lock_irqsave(&ns6->midi_out_lock, flags);
+
+    if (!ns6->ep_midi_out || !ns6->midi_out_sub || ns6->midi_out_busy) {
+        spin_unlock_irqrestore(&ns6->midi_out_lock, flags);
         return;
     }
+
+    ns6->midi_out_busy = true;
 
     /* Puxa byte por byte do buffer do ALSA */
     while (snd_rawmidi_transmit(ns6->midi_out_sub, &byte, 1) == 1) {
         
-        /* Ressincroniza o robô se encontrar um byte de comando (ex: 0x90) */
         if (byte >= 0x80) ns6->midi_out_cache_len = 0;
         
         if (ns6->midi_out_cache_len < 3)
             ns6->midi_out_cache[ns6->midi_out_cache_len++] = byte;
 
-        /* Quando acumular 3 bytes (Comando MIDI completo), enviamos! */
+        /* Comando completo! Enviaremos e sairemos da sala */
         if (ns6->midi_out_cache_len == 3) {
             memset(ns6->midi_out_buf, NS6_IDLE_BYTE, NS6_MIDI_PKT_SIZE);
             ns6->midi_out_buf[0] = ns6->midi_out_cache[0];
@@ -288,7 +313,7 @@ static void ns6_process_midi_out(struct ns6 *ns6) {
             ns6->midi_out_buf[2] = ns6->midi_out_cache[2];
             ns6->midi_out_buf[NS6_MIDI_PKT_SIZE - 1] = NS6_PKT_TERM;
 
-            ns6->midi_out_cache_len = 0; /* Zera para não poluir o próximo */
+            ns6->midi_out_cache_len = 0; 
 
             if (usb_endpoint_xfer_int(ns6->ep_midi_out)) {
                 usb_fill_int_urb(ns6->midi_out_urb, ns6->udev, 
@@ -308,44 +333,52 @@ static void ns6_process_midi_out(struct ns6 *ns6) {
                 pr_err("NS6: Falha no URB MIDI de LEDs (%d)\n", err);
                 ns6->midi_out_busy = false;
             }
-            /* Sai da função! O callback (urb_cb) se encarrega de puxar a próxima luz */
+            
+            spin_unlock_irqrestore(&ns6->midi_out_lock, flags);
             return; 
         }
     }
 
-    /* Se não houver mais luzes pra acender, desocupa a porta */
+    /* Se não houver mais luzes pra acender, desocupa e libera a porta */
     ns6->midi_out_busy = false;
+    spin_unlock_irqrestore(&ns6->midi_out_lock, flags);
 }
 
 /* O CORPO DO CALLBACK FICA AQUI EMBAIXO */
 static void ns6_midi_out_urb_cb(struct urb *urb) {
     struct ns6 *ns6 = urb->context; 
-    unsigned long flags;
     
-    /* Quando a luz passada terminou de acender, avisa o robô para mandar a próxima */
-    spin_lock_irqsave(&ns6->midi_out_lock, flags); 
+    /* Cadeado retirado daqui. O robô se tranca sozinho agora. */
+    ns6->midi_out_busy = false; /* Avisamos que a porta terminou */
     ns6_process_midi_out(ns6);
-    spin_unlock_irqrestore(&ns6->midi_out_lock, flags);
 }
 
 static int ns6_midi_in_open(struct snd_rawmidi_substream *sub) { ((struct ns6*)sub->rmidi->private_data)->midi_in_sub = sub; return 0; }
 static int ns6_midi_in_close(struct snd_rawmidi_substream *sub) { ((struct ns6*)sub->rmidi->private_data)->midi_in_sub = NULL; return 0; }
 static void ns6_midi_in_trigger(struct snd_rawmidi_substream *sub, int up) {}
-static int ns6_midi_out_open(struct snd_rawmidi_substream *sub) { ((struct ns6*)sub->rmidi->private_data)->midi_out_sub = sub; return 0; }
-static int ns6_midi_out_close(struct snd_rawmidi_substream *sub) { ((struct ns6*)sub->rmidi->private_data)->midi_out_sub = NULL; return 0; }
+
+static int ns6_midi_out_open(struct snd_rawmidi_substream *sub) { 
+    struct ns6 *ns6 = sub->rmidi->private_data;
+    ns6->midi_out_sub = sub;
+    
+    /* Zera o robô para a rajada inicial do Mixxx */
+    ns6->midi_out_busy = false;
+    ns6->midi_out_cache_len = 0;
+    
+    return 0; 
+}
+static int ns6_midi_out_close(struct snd_rawmidi_substream *sub) { 
+    ((struct ns6*)sub->rmidi->private_data)->midi_out_sub = NULL; 
+    return 0; 
+}
 
 static void ns6_midi_out_trigger(struct snd_rawmidi_substream *sub, int up) {
     struct ns6 *ns6 = sub->rmidi->private_data; 
-    unsigned long flags;
 
     if (!up) return;
 
-    spin_lock_irqsave(&ns6->midi_out_lock, flags);
-    if (!ns6->midi_out_busy) {
-        ns6->midi_out_busy = true;
-        ns6_process_midi_out(ns6);
-    }
-    spin_unlock_irqrestore(&ns6->midi_out_lock, flags);
+    /* Cadeado retirado daqui também! */
+    ns6_process_midi_out(ns6);
 }
 
 static const struct snd_rawmidi_ops ns6_midi_in_ops = { .open = ns6_midi_in_open, .close = ns6_midi_in_close, .trigger = ns6_midi_in_trigger };
@@ -394,14 +427,25 @@ static int ns6_pcm_hw_free(struct snd_pcm_substream *sub) {
     unsigned long flags;
     int i;
     
-    /* Ao fechar a música, cortamos a força dos cabos e matamos os URBs pacificamente */
+    /* Cortamos a força dos cabos e matamos os URBs pacificamente */
     spin_lock_irqsave(&s->lock, flags);
     s->active_usb = false; 
     s->active_pcm = false;
+    
+    /* TRUQUE DO RELÓGIO: Se parou o Playback, desliga também o "Respirador" da entrada */
+    if (sub->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+        ns6->cap.active_usb = false;
+    }
     spin_unlock_irqrestore(&s->lock, flags);
 
     for (i = 0; i < NS6_NURBS; i++) {
-        if (s->urbs[i]) usb_kill_urb(s->urbs[i]);
+        if (s->urbs[i]) {
+            usb_kill_urb(s->urbs[i]);
+        }
+        /* Mata os URBs do respirador invisível junto com a música */
+        if (sub->stream == SNDRV_PCM_STREAM_PLAYBACK && ns6->cap.urbs[i]) {
+            usb_kill_urb(ns6->cap.urbs[i]);
+        }
     }
     return 0; 
 }
@@ -410,24 +454,90 @@ static int ns6_pcm_prepare(struct snd_pcm_substream *sub) {
     struct ns6 *ns6 = snd_pcm_substream_chip(sub);
     struct ns6_stream *s = (sub->stream == SNDRV_PCM_STREAM_PLAYBACK) ? &ns6->play : &ns6->cap;
     unsigned long flags;
-    int i, err;
-    
+    int i, j, err;
+    int success_count = 0;
+
     spin_lock_irqsave(&s->lock, flags);
-    s->hwptr = 0; s->period_pos = 0; s->phase = 0;
+    s->hwptr = 0; 
+    s->period_pos = 0; 
+    
+    /* Só zera a fase e o warm-up se for uma partida fria (USB desligado)
+     * Isso impede que o relógio dê solavancos quando mudamos de música! */
+    if (!s->active_usb) {
+        s->phase = 0;
+        s->warmup_cnt = 50; 
+    }
     spin_unlock_irqrestore(&s->lock, flags);
 
-    /* O Mixxx chama prepare várias vezes. Só ligamos a força 1 vez para não dar Panic! */
     if (!s->active_usb) {
         s->active_usb = true;
-        for (i = 0; i < NS6_NURBS; i++) {
-            if (s->urbs[i]) {
-                err = usb_submit_urb(s->urbs[i], GFP_KERNEL);
-                if (err) pr_err("NS6: Falha ao ligar URB %d (%d)\n", i, err);
+        
+        /* ==================================================================== *
+         * TRUQUE DO RELÓGIO (ANTI-DRIFT E ANTI-OVERFLOW):
+         * Se ligarmos a Saída (Playback), ativamos a Entrada (Capture) 
+         * silenciosamente no fundo. Isso esvazia o buffer interno do chip da NS6,
+         * sincroniza o USB e impede que o áudio estoure aos 4 minutos!
+         * ==================================================================== */
+        if (sub->stream == SNDRV_PCM_STREAM_PLAYBACK && !ns6->cap.active_usb) {
+            ns6->cap.active_usb = true;
+            for (i = 0; i < NS6_NURBS; i++) {
+                if (ns6->cap.urbs[i]) {
+                    /* Limpa a memória antes de enviar para não estourar o buffer */
+                    memset(ns6->cap.urbs[i]->transfer_buffer, 0, ns6->cap.urbs[i]->transfer_buffer_length);
+                    usb_submit_urb(ns6->cap.urbs[i], GFP_KERNEL);
+                }
             }
         }
+
+        for (i = 0; i < NS6_NURBS; i++) {
+            if (s->urbs[i]) {
+                
+                /* O SEGREDO E A PROTEÇÃO: 
+                 * A formatação matemática avançada só se aplica à SAÍDA (Playback) */
+                if (sub->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+                    unsigned int total_bytes = 0;
+                    for (j = 0; j < s->urbs[i]->number_of_packets; j++) {
+                        unsigned int pk_frames = 5; 
+                        s->phase += 41;          
+                        if (s->phase >= 80) { pk_frames += 1; s->phase -= 80; }
+                        unsigned int pk_bytes = pk_frames * NS6_FRAME_BYTES;
+                        
+                        s->urbs[i]->iso_frame_desc[j].offset = total_bytes;
+                        s->urbs[i]->iso_frame_desc[j].length = pk_bytes;
+                        total_bytes += pk_bytes;
+                    }
+                    memset(s->urbs[i]->transfer_buffer, 0, total_bytes);
+                } else {
+                    /* Para ENTRADA (Capture), o hardware decide. Nós apenas limpamos 
+                     * o tamanho exato da memória sem vazar pelo teto (Anti-Overflow) */
+                    memset(s->urbs[i]->transfer_buffer, 0, s->urbs[i]->transfer_buffer_length);
+                }
+
+                /* Agora sim enviamos um pacote limpo para a porta USB */
+                err = usb_submit_urb(s->urbs[i], GFP_KERNEL);
+                if (err) {
+                    pr_err("NS6: Erro ao submeter URB %d no %s (%d)\n", 
+                           i, (sub->stream == SNDRV_PCM_STREAM_PLAYBACK) ? "Playback" : "Capture", err);
+                    s->active_usb = false; 
+                    return err;
+                }
+                success_count++;
+            }
+        }
+        
+        if (success_count > 0) {
+            pr_info("NS6: Motor de %s iniciado com %d URBs (Sincronia 44.1kHz OK)\n",
+                    (sub->stream == SNDRV_PCM_STREAM_PLAYBACK) ? "Saida" : "Entrada", 
+                    success_count);
+        }
+    } else {
+        pr_debug("NS6: %s re-preparado (USB ja estava ativo)\n",
+                 (sub->stream == SNDRV_PCM_STREAM_PLAYBACK) ? "Playback" : "Capture");
     }
+
     return 0;
 }
+
 
 static int ns6_pcm_trigger(struct snd_pcm_substream *sub, int cmd) {
     struct ns6 *ns6 = snd_pcm_substream_chip(sub);
@@ -651,6 +761,12 @@ static void ns6_disconnect(struct usb_interface *intf) {
 
 static const struct usb_device_id ns6_id_table[] = { { USB_DEVICE_INTERFACE_NUMBER(NS6_VID, NS6_PID, 0) }, { } };
 MODULE_DEVICE_TABLE(usb, ns6_id_table);
-static struct usb_driver ns6_driver = { .name = DRV_NAME, .probe = ns6_probe, .disconnect = ns6_disconnect, .id_table = ns6_id_table, };
+static struct usb_driver ns6_driver = { 
+    .name = DRV_NAME, 
+    .probe = ns6_probe, 
+    .disconnect = ns6_disconnect, 
+    .id_table = ns6_id_table,
+    .supports_autosuspend = 0, 
+};
 module_usb_driver(ns6_driver);
 MODULE_AUTHOR("ns6d project"); MODULE_DESCRIPTION("Numark NS6 complete USB driver"); MODULE_LICENSE("GPL v2");
