@@ -1174,11 +1174,6 @@ deps_snd-ns6-audio.o := \
   /usr/src/kernels/6.19.8-100.fc42.x86_64/arch/x86/include/asm/device.h \
   /usr/src/kernels/6.19.8-100.fc42.x86_64/include/linux/pm_wakeup.h \
   /usr/src/kernels/6.19.8-100.fc42.x86_64/include/linux/pm_runtime.h \
-  /usr/src/kernels/6.19.8-100.fc42.x86_64/include/linux/vmalloc.h \
-    $(wildcard include/config/HAVE_ARCH_HUGE_VMALLOC) \
-  /usr/src/kernels/6.19.8-100.fc42.x86_64/arch/x86/include/asm/vmalloc.h \
-    $(wildcard include/config/HAVE_ARCH_HUGE_VMAP) \
-  /usr/src/kernels/6.19.8-100.fc42.x86_64/arch/x86/include/asm/pgtable_areas.h \
   /usr/src/kernels/6.19.8-100.fc42.x86_64/include/sound/core.h \
     $(wildcard include/config/SND_DYNAMIC_MINORS) \
     $(wildcard include/config/SND_MAX_CARDS) \
@@ -1252,6 +1247,7 @@ deps_snd-ns6-audio.o := \
     $(wildcard include/config/ARCH_HAS_HW_PTE_YOUNG) \
     $(wildcard include/config/GUP_GET_PXX_LOW_HIGH) \
     $(wildcard include/config/ARCH_WANT_PMD_MKWRITE) \
+    $(wildcard include/config/HAVE_ARCH_HUGE_VMAP) \
     $(wildcard include/config/X86_ESPFIX64) \
   /usr/src/kernels/6.19.8-100.fc42.x86_64/include/linux/memremap.h \
     $(wildcard include/config/DEVICE_PRIVATE) \
