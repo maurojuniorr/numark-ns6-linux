@@ -1,1 +1,0 @@
-savedcmd_snd-ns6.ko := ld -r -m elf_x86_64 -z noexecstack --no-warn-rwx-segments --build-id=sha1  -T /usr/src/kernels/6.19.9-100.fc42.x86_64/scripts/module.lds -o snd-ns6.ko snd-ns6.o snd-ns6.mod.o .module-common.o

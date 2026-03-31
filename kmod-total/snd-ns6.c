@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * snd-ns6.c — Numark NS6 complete USB driver
- * ALSA STABLE EDITION (Double-Buffer & Anti-Crash)
+ * THE MASTERPIECE EDITION (Dynamic Sync, Smart MIDI & ALSA Clean State)
  */
 
 #include <linux/module.h>
@@ -19,29 +19,34 @@
 #define NS6_VID         0x15e4
 #define NS6_PID         0x0079
 
-/* Endpoints */
+/* Endpoints (Interface 0, Alt 1) */
 #define NS6_EP_PLAY     0x02
 #define NS6_EP_MIDI_IN  0x83
 #define NS6_EP_MIDI_OUT 0x04
-#define NS6_EP_CAP      0x81
 
-/* PCM format */
+/* Endpoint de Feedback Explícito (Interface 1, Alt 1) */
+#define NS6_EP_SYNC     0x81
+
+/* PCM format (Playback Only) */
 #define NS6_RATE            44100
 #define NS6_CHANNELS        4
 #define NS6_SAMPLE_BYTES    3
 #define NS6_FRAME_BYTES     (NS6_CHANNELS * NS6_SAMPLE_BYTES)  /* 12 */
 #define NS6_PKTS_PER_URB    32
-#define NS6_PKT_SIZE        72   
+#define NS6_PKT_SIZE        156    /* wMaxPacketSize real do descriptor */
 #define NS6_URB_BYTES       (NS6_PKTS_PER_URB * NS6_PKT_SIZE)  
 #define NS6_NURBS           6
+
+/* Configurações do EP Sync (0x81) */
+#define NS6_SYNC_PKTS_PER_URB 16
+#define NS6_SYNC_PKT_SIZE     64
+#define NS6_SYNC_URB_BYTES    (NS6_SYNC_PKTS_PER_URB * NS6_SYNC_PKT_SIZE)
 
 /* MIDI */
 #define NS6_MIDI_PKT_SIZE   42
 #define NS6_MIDI_NURBS      4
 #define NS6_IDLE_BYTE       0xFD
 #define NS6_PKT_TERM        0x00
-
-
 
 struct ns6_stream {
     struct urb               *urbs[NS6_NURBS];
@@ -51,11 +56,13 @@ struct ns6_stream {
     spinlock_t                lock;
     unsigned int              hwptr;
     unsigned int              period_pos;
-    unsigned int              phase; 
-    bool                      active_usb; /* Mantém o cabo vivo enviando silêncio */
-    bool                      active_pcm; /* Libera o áudio real da música */
-    int                       warmup_cnt; /* ADICIONE ESTA LINHA */
-    unsigned int              log_counter; /* ADICIONE ESTE ESPIÃO AQUI */
+    bool                      active_usb; 
+    bool                      active_pcm; 
+    int                       warmup_cnt; 
+    
+    /* ACELERADOR DO ÁUDIO DINÂMICO */
+    unsigned int              frac_acc;
+    unsigned int              frac_num; /* Velocidade real do hardware */
 };
 
 struct ns6 {
@@ -63,30 +70,42 @@ struct ns6 {
     struct snd_card      *card;
     struct snd_pcm       *pcm;
     struct ns6_stream     play;
-    struct ns6_stream     cap;
+    
+    /* EP 0x81: URBs de feedback ISO (Apenas Leitura de Relógio) */
+    struct urb           *sync_urbs[NS6_NURBS];
+    unsigned char        *sync_bufs[NS6_NURBS];
+    dma_addr_t            sync_dma[NS6_NURBS];
+    bool                  sync_active;
 
-    struct snd_rawmidi       *rmidi;
-    struct snd_rawmidi_substream *midi_in_sub;
-    struct snd_rawmidi_substream *midi_out_sub;
+    struct snd_rawmidi             *rmidi;
+    struct snd_rawmidi_substream   *midi_in_sub;
+    struct snd_rawmidi_substream   *midi_out_sub;
 
     struct urb           *midi_in_urbs[NS6_MIDI_NURBS];
     uint8_t               midi_in_buf[NS6_MIDI_NURBS][NS6_MIDI_PKT_SIZE];
-    struct urb           *midi_out_urb;
-    uint8_t               midi_out_buf[NS6_MIDI_PKT_SIZE];
-    spinlock_t            midi_out_lock;
-    bool                  midi_out_busy;
     
-    /* VARIÁVEIS DO CACHE DA FILA DE LEDS */
-    uint8_t               midi_out_cache[3];
+    /* Pool BLINDADO de URBs de MIDI OUT */
+    #define NS6_MIDI_OUT_NURBS  4
+    struct urb           *midi_out_urbs[NS6_MIDI_OUT_NURBS];
+    uint8_t               midi_out_bufs[NS6_MIDI_OUT_NURBS][NS6_MIDI_PKT_SIZE];
+    bool                  midi_out_busy[NS6_MIDI_OUT_NURBS];
+    spinlock_t            midi_out_lock;
+
+    /* Cache Inteligente de MIDI */
+    uint8_t               midi_out_cache[4]; 
     int                   midi_out_cache_len;
     
+    struct usb_interface  *intf1; 
     struct work_struct    init_work;
 
     struct usb_endpoint_descriptor *ep_play;
-    struct usb_endpoint_descriptor *ep_cap;
+    struct usb_endpoint_descriptor *ep_sync;
     struct usb_endpoint_descriptor *ep_midi_in;
     struct usb_endpoint_descriptor *ep_midi_out;
 };
+
+static struct usb_driver ns6_driver; 
+
 /* ========================================================================= *
  * DYNAMIC ENDPOINT FINDER
  * ========================================================================= */
@@ -99,8 +118,6 @@ static struct usb_endpoint_descriptor *ns6_get_ep_desc(struct usb_device *udev, 
             for (e = 0; e < alt->desc.bNumEndpoints; e++) {
                 if (alt->endpoint[e].desc.bEndpointAddress == ep_addr) {
                     if (intf->cur_altsetting != alt) {
-                        pr_info("NS6: EP 0x%02x achado escondido! Ativando Interface %d Altsetting %d...\n", 
-                                ep_addr, alt->desc.bInterfaceNumber, alt->desc.bAlternateSetting);
                         usb_set_interface(udev, alt->desc.bInterfaceNumber, alt->desc.bAlternateSetting);
                     }
                     return &alt->endpoint[e].desc;
@@ -121,7 +138,7 @@ static struct usb_endpoint_descriptor *ns6_get_ep_desc(struct usb_device *udev, 
 
 static void ns6_deferred_init(struct work_struct *work) {
     struct ns6 *ns6 = container_of(work, struct ns6, init_work);
-    int actual_len; /* Retiramos o 'err' daqui para limpar o warning! */
+    int actual_len; 
     u8 *buf = kzalloc(NS6_CTRL_PKT_SIZE, GFP_KERNEL);
 
     if (!buf) return;
@@ -140,17 +157,14 @@ static void ns6_deferred_init(struct work_struct *work) {
     buf[NS6_CTRL_PKT_SIZE - 1] = NS6_PKT_TERMINATOR;
     memcpy(buf, sysex_init, sizeof(sysex_init));
 
-    if (!ns6->ep_midi_out) {
-        kfree(buf); return;
+    if (ns6->ep_midi_out) {
+        if (usb_endpoint_xfer_int(ns6->ep_midi_out)) {
+            usb_interrupt_msg(ns6->udev, usb_sndintpipe(ns6->udev, NS6_EP_MIDI_OUT), buf, NS6_CTRL_PKT_SIZE, &actual_len, 2000);
+        } else {
+            usb_bulk_msg(ns6->udev, usb_sndbulkpipe(ns6->udev, NS6_EP_MIDI_OUT), buf, NS6_CTRL_PKT_SIZE, &actual_len, 2000);
+        }
     }
-
-    if (usb_endpoint_xfer_int(ns6->ep_midi_out)) {
-        usb_interrupt_msg(ns6->udev, usb_sndintpipe(ns6->udev, NS6_EP_MIDI_OUT), buf, NS6_CTRL_PKT_SIZE, &actual_len, 2000);
-    } else {
-        usb_bulk_msg(ns6->udev, usb_sndbulkpipe(ns6->udev, NS6_EP_MIDI_OUT), buf, NS6_CTRL_PKT_SIZE, &actual_len, 2000);
-    }
-
-    pr_info("NS6: Inicializacao Concluida!\n");
+    pr_info("NS6: Vendor Mode Ativado.\n");
     kfree(buf);
 }
 
@@ -173,20 +187,27 @@ static void ns6_play_urb_cb(struct urb *urb) {
     spin_lock_irqsave(&s->lock, flags);
     sub = s->substream;
 
-    /* Se estiver no aquecimento ou pausado, fill_silence = true */
     if (s->warmup_cnt > 0 || !s->active_pcm || !sub || !snd_pcm_running(sub)) {
         fill_silence = true;
         if (s->warmup_cnt > 0) s->warmup_cnt--;
     }
 
-    /* 1. SEMPRE RODA A MATEMÁTICA DO RELÓGIO (Mesmo no silêncio absoluto!)
-     * Isso mantém o PLL da placa travado em perfeitos 44.100Hz o tempo todo. */
+    /* 1. ACELERADOR DINÂMICO (High-Speed USB @ 8000 microframes/s) */
+    unsigned int target_rate = s->frac_num ? s->frac_num : NS6_RATE;
+
     for (i = 0; i < urb->number_of_packets; i++) {
-        unsigned int pk_frames = 5; 
-        s->phase += 41;          
-        if (s->phase >= 80) { pk_frames += 1; s->phase -= 80; }
+        s->frac_acc += target_rate;
+        unsigned int pk_frames = s->frac_acc / 8000;
+        s->frac_acc %= 8000;
+        
         unsigned int pk_bytes = pk_frames * NS6_FRAME_BYTES;
         
+        /* Limite de segurança do buffer */
+        if (pk_bytes > NS6_PKT_SIZE) {
+            pk_bytes = NS6_PKT_SIZE;
+            pk_frames = pk_bytes / NS6_FRAME_BYTES;
+        }
+
         urb->iso_frame_desc[i].offset = total_bytes;
         urb->iso_frame_desc[i].length = pk_bytes;
         
@@ -196,10 +217,8 @@ static void ns6_play_urb_cb(struct urb *urb) {
 
     /* 2. PREENCHE COM ÁUDIO OU SILÊNCIO */
     if (fill_silence) {
-        /* Manda zeros, mas com o tamanho fracionário matematicamente perfeito */
         memset(urb->transfer_buffer, 0, total_bytes);
     } else {
-        /* Manda a música real do ALSA */
         unsigned int buf_frames = sub->runtime->buffer_size;
         unsigned char *dma = sub->runtime->dma_area;
         unsigned int hwptr_old = s->hwptr;
@@ -223,40 +242,61 @@ static void ns6_play_urb_cb(struct urb *urb) {
     }
     spin_unlock_irqrestore(&s->lock, flags);
 
-    /* Só avisa o Mixxx que o tempo passou se a música estiver rodando */
-    if (elapsed && !fill_silence) snd_pcm_period_elapsed(sub);
+    /* O FIX DO CLAUDE: O ALSA precisa ser avisado mesmo durante o warmup para não engasgar! */
+    if (elapsed && sub) snd_pcm_period_elapsed(sub);
 
-/* ==================================================================== *
-     * SISTEMA DE TELEMETRIA AO VIVO CORRIGIDO (MONITOR DE DRIFT)
-     * ==================================================================== */
-    if (!fill_silence && sub && sub->runtime) {
-        s->log_counter++;
-        /* Dispara o log a cada ~1 segundo */
-        if (s->log_counter >= 100) {
-            s->log_counter = 0;
-            
-            /* Agora sim, os dois ponteiros são absolutos e alinhados! */
-            snd_pcm_uframes_t appl = sub->runtime->control->appl_ptr;
-            snd_pcm_uframes_t hw = sub->runtime->status->hw_ptr;
-            long delay = appl - hw;
-            
-            pr_info("NS6 TELEMETRIA: PC=%lu | Placa=%lu | Tanque Real: %ld / %lu\n",
-                    (unsigned long)appl, (unsigned long)hw, delay, 
-                    (unsigned long)sub->runtime->buffer_size);
-        }
-    }
     if (s->active_usb) usb_submit_urb(urb, GFP_ATOMIC);
 }
 
-static void ns6_cap_urb_cb(struct urb *urb) {
+/* ========================================================================= *
+ * EP 0x81 SYNC — O Ouvido do Cristal (A Cura do Drift)
+ * ========================================================================= */
+static void ns6_sync_urb_cb(struct urb *urb)
+{
     struct ns6 *ns6 = urb->context;
-    if (urb->status != 0 && urb->status != -EXDEV) return;
-    if (ns6->cap.active_usb) usb_submit_urb(urb, GFP_ATOMIC);
+    int i;
+    
+    if (urb->status == 0 && ns6->play.active_usb) {
+        for (i = 0; i < urb->number_of_packets; i++) {
+            if (urb->iso_frame_desc[i].actual_length >= 3) {
+                unsigned char *data = urb->transfer_buffer + urb->iso_frame_desc[i].offset;
+                unsigned int feedback = (data[2] << 16) | (data[1] << 8) | data[0];
+                
+                /* Cálculo oficial para High-Speed USB Asynchronous (Formato 16.16) */
+                unsigned int real_rate = (feedback * 125) / 1024;
+                
+                /* Filtro de sanidade e estabilizador de Jitter */
+                if (real_rate > 44000 && real_rate < 44300) {
+                    if (ns6->play.frac_num == 0) {
+                        ns6->play.frac_num = real_rate; /* Primeira leitura bruta */
+                    } else {
+                        /* Suavização passa-baixa para o Mixxx não notar flutuações bruscas */
+                        ns6->play.frac_num = ((ns6->play.frac_num * 31) + real_rate) / 32;
+                    }
+                }
+            }
+        }
+    }
+
+    if (ns6->sync_active) usb_submit_urb(urb, GFP_ATOMIC);
 }
 
+
 /* ========================================================================= *
- * MIDI (COM FILA DE ESPERA CONTÍNUA ANTI-PERDA DE PACOTES)
+ * DECLARAÇÕES PRÉVIAS
  * ========================================================================= */
+static void ns6_process_midi_out(struct ns6 *ns6);
+
+/* ========================================================================= *
+ * MIDI (COM INTELIGÊNCIA RUNNING STATUS E ANTI-CRASH)
+ * ========================================================================= */
+static inline int get_midi_msg_len(uint8_t status) {
+    if (status >= 0xF8) return 1; 
+    uint8_t cmd = status & 0xF0;
+    if (cmd == 0xC0 || cmd == 0xD0) return 2; 
+    return 3; 
+}
+
 static void ns6_parse_midi(struct ns6 *ns6, const uint8_t *pkt, int len) {
     struct snd_rawmidi_substream *sub = ns6->midi_in_sub;
     int i = 0;
@@ -278,79 +318,122 @@ static void ns6_midi_in_urb_cb(struct urb *urb) {
     usb_submit_urb(urb, GFP_ATOMIC);
 }
 
-/* ---> DECLARAÇÃO PRÉVIA: Ensina ao compilador que o Callback existe! <--- */
-static void ns6_midi_out_urb_cb(struct urb *urb);
+static void ns6_midi_out_urb_cb(struct urb *urb) {
+    struct ns6 *ns6 = urb->context; 
+    unsigned long flags;
+    int i;
+    
+    spin_lock_irqsave(&ns6->midi_out_lock, flags);
+    for (i = 0; i < NS6_MIDI_OUT_NURBS; i++) {
+        if (ns6->midi_out_urbs[i] == urb) {
+            ns6->midi_out_busy[i] = false;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&ns6->midi_out_lock, flags);
+    
+    /* URB liberado! Chama o robô pra continuar esvaziando a fila */
+    ns6_process_midi_out(ns6);
+}
 
-/* O ROBÔ DA FILA: Puxa pacotes do Mixxx, empacota em 42 bytes e despacha */
 static void ns6_process_midi_out(struct ns6 *ns6) {
     uint8_t byte;
-    int err;
-    unsigned long flags; /* ADICIONADO PARA O CADEADO INTERNO */
+    unsigned long flags;
 
-    /* Bloqueia a porta para ninguém entrar enquanto o robô pensa */
     spin_lock_irqsave(&ns6->midi_out_lock, flags);
 
-    if (!ns6->ep_midi_out || !ns6->midi_out_sub || ns6->midi_out_busy) {
+    if (!ns6->ep_midi_out || !ns6->midi_out_sub) {
         spin_unlock_irqrestore(&ns6->midi_out_lock, flags);
         return;
     }
 
-    ns6->midi_out_busy = true;
-
-    /* Puxa byte por byte do buffer do ALSA */
-    while (snd_rawmidi_transmit(ns6->midi_out_sub, &byte, 1) == 1) {
+    /* Loop principal: Otimiza e esvazia o ALSA o mais rápido possível */
+    while (1) {
+        int idx = -1, i;
         
-        if (byte >= 0x80) ns6->midi_out_cache_len = 0;
+        /* 1. Procura caminhão (URB) livre no estacionamento */
+        for (i = 0; i < NS6_MIDI_OUT_NURBS; i++) {
+            if (!ns6->midi_out_busy[i]) {
+                idx = i; break;
+            }
+        }
         
-        if (ns6->midi_out_cache_len < 3)
-            ns6->midi_out_cache[ns6->midi_out_cache_len++] = byte;
+        /* Sem caminhão livre? Paramos e deixamos o ALSA esperar (Evita Crash) */
+        if (idx == -1) break; 
 
-        /* Comando completo! Enviaremos e sairemos da sala */
-        if (ns6->midi_out_cache_len == 3) {
-            memset(ns6->midi_out_buf, NS6_IDLE_BYTE, NS6_MIDI_PKT_SIZE);
-            ns6->midi_out_buf[0] = ns6->midi_out_cache[0];
-            ns6->midi_out_buf[1] = ns6->midi_out_cache[1];
-            ns6->midi_out_buf[2] = ns6->midi_out_cache[2];
-            ns6->midi_out_buf[NS6_MIDI_PKT_SIZE - 1] = NS6_PKT_TERM;
+        struct urb *u = ns6->midi_out_urbs[idx];
+        uint8_t    *buf = ns6->midi_out_bufs[idx];
+        int buf_pos = 0;
+        bool has_data = false;
 
-            ns6->midi_out_cache_len = 0; 
+        /* 2. Enche o caminhão com até 13 comandos de LED (39 bytes) */
+        while (buf_pos + 3 <= NS6_MIDI_PKT_SIZE - 1) {
+            
+            /* Lê bytes do Mixxx até completar o comando atual */
+            while (ns6->midi_out_cache[3] == 0 || ns6->midi_out_cache_len < ns6->midi_out_cache[3]) {
+                if (snd_rawmidi_transmit(ns6->midi_out_sub, &byte, 1) != 1) {
+                    break; /* Secou a fonte do ALSA */
+                }
+                
+                if (byte >= 0x80) {
+                    ns6->midi_out_cache[0] = byte;
+                    ns6->midi_out_cache_len = 1;
+                    ns6->midi_out_cache[3] = get_midi_msg_len(byte); 
+                } else {
+                    /* Lógica do Running Status */
+                    if (ns6->midi_out_cache_len == 0 && ns6->midi_out_cache[3] > 0) {
+                        ns6->midi_out_cache_len = 1; 
+                    }
+                    if (ns6->midi_out_cache[3] > 0) {
+                        ns6->midi_out_cache[ns6->midi_out_cache_len++] = byte;
+                    }
+                }
+            }
 
-            if (usb_endpoint_xfer_int(ns6->ep_midi_out)) {
-                usb_fill_int_urb(ns6->midi_out_urb, ns6->udev, 
-                                 usb_sndintpipe(ns6->udev, NS6_EP_MIDI_OUT), 
-                                 ns6->midi_out_buf, NS6_MIDI_PKT_SIZE, 
-                                 ns6_midi_out_urb_cb, ns6, 
-                                 ns6->ep_midi_out->bInterval);
+            /* Se completamos uma mensagem inteira, joga para dentro do buffer USB! */
+            if (ns6->midi_out_cache[3] > 0 && ns6->midi_out_cache_len == ns6->midi_out_cache[3]) {
+                
+                /* O hardware da Numark exige alinhamento perfeito de 3 bytes */
+                buf[buf_pos++] = ns6->midi_out_cache[0];
+                buf[buf_pos++] = (ns6->midi_out_cache_len > 1) ? ns6->midi_out_cache[1] : 0x00;
+                buf[buf_pos++] = (ns6->midi_out_cache_len > 2) ? ns6->midi_out_cache[2] : 0x00;
+                
+                ns6->midi_out_cache_len = 0; /* Zera cache para o próximo comando */
+                has_data = true;
             } else {
-                usb_fill_bulk_urb(ns6->midi_out_urb, ns6->udev, 
-                                  usb_sndbulkpipe(ns6->udev, NS6_EP_MIDI_OUT), 
-                                  ns6->midi_out_buf, NS6_MIDI_PKT_SIZE, 
-                                  ns6_midi_out_urb_cb, ns6);
+                /* Se não completou, o ALSA esvaziou. Saímos do loop de empacotamento. */
+                break; 
             }
-            
-            err = usb_submit_urb(ns6->midi_out_urb, GFP_ATOMIC);
-            if (err) {
-                pr_err("NS6: Falha no URB MIDI de LEDs (%d)\n", err);
-                ns6->midi_out_busy = false;
-            }
-            
-            spin_unlock_irqrestore(&ns6->midi_out_lock, flags);
-            return; 
+        }
+
+        /* Se o caminhão estiver totalmente vazio, não despacha. */
+        if (!has_data) break;
+
+        ns6->midi_out_busy[idx] = true;
+        
+        /* 3. Preenche os buracos vazios restantes do pacote com NS6_IDLE_BYTE (0xFD) */
+        while (buf_pos < NS6_MIDI_PKT_SIZE - 1) {
+            buf[buf_pos++] = NS6_IDLE_BYTE;
+        }
+        /* Coloca o terminador no último byte */
+        buf[NS6_MIDI_PKT_SIZE - 1] = NS6_PKT_TERM;
+
+        /* 4. Despacha para a controladora! */
+        if (usb_endpoint_xfer_int(ns6->ep_midi_out)) {
+            usb_fill_int_urb(u, ns6->udev, usb_sndintpipe(ns6->udev, NS6_EP_MIDI_OUT), 
+                             buf, NS6_MIDI_PKT_SIZE, ns6_midi_out_urb_cb, ns6, ns6->ep_midi_out->bInterval);
+        } else {
+            usb_fill_bulk_urb(u, ns6->udev, usb_sndbulkpipe(ns6->udev, NS6_EP_MIDI_OUT), 
+                              buf, NS6_MIDI_PKT_SIZE, ns6_midi_out_urb_cb, ns6);
+        }
+        
+        if (usb_submit_urb(u, GFP_ATOMIC)) {
+            ns6->midi_out_busy[idx] = false; /* Deu erro? Libera a vaga. */
+            break; 
         }
     }
-
-    /* Se não houver mais luzes pra acender, desocupa e libera a porta */
-    ns6->midi_out_busy = false;
-    spin_unlock_irqrestore(&ns6->midi_out_lock, flags);
-}
-
-/* O CORPO DO CALLBACK FICA AQUI EMBAIXO */
-static void ns6_midi_out_urb_cb(struct urb *urb) {
-    struct ns6 *ns6 = urb->context; 
     
-    /* Cadeado retirado daqui. O robô se tranca sozinho agora. */
-    ns6->midi_out_busy = false; /* Avisamos que a porta terminou */
-    ns6_process_midi_out(ns6);
+    spin_unlock_irqrestore(&ns6->midi_out_lock, flags);
 }
 
 static int ns6_midi_in_open(struct snd_rawmidi_substream *sub) { ((struct ns6*)sub->rmidi->private_data)->midi_in_sub = sub; return 0; }
@@ -360,32 +443,24 @@ static void ns6_midi_in_trigger(struct snd_rawmidi_substream *sub, int up) {}
 static int ns6_midi_out_open(struct snd_rawmidi_substream *sub) { 
     struct ns6 *ns6 = sub->rmidi->private_data;
     ns6->midi_out_sub = sub;
-    
-    /* Zera o robô para a rajada inicial do Mixxx */
-    ns6->midi_out_busy = false;
     ns6->midi_out_cache_len = 0;
-    
+    ns6->midi_out_cache[3] = 0; 
+    memset(ns6->midi_out_busy, 0, sizeof(ns6->midi_out_busy));
     return 0; 
 }
 static int ns6_midi_out_close(struct snd_rawmidi_substream *sub) { 
     ((struct ns6*)sub->rmidi->private_data)->midi_out_sub = NULL; 
     return 0; 
 }
-
 static void ns6_midi_out_trigger(struct snd_rawmidi_substream *sub, int up) {
-    struct ns6 *ns6 = sub->rmidi->private_data; 
-
-    if (!up) return;
-
-    /* Cadeado retirado daqui também! */
-    ns6_process_midi_out(ns6);
+    if (up) ns6_process_midi_out(sub->rmidi->private_data);
 }
 
 static const struct snd_rawmidi_ops ns6_midi_in_ops = { .open = ns6_midi_in_open, .close = ns6_midi_in_close, .trigger = ns6_midi_in_trigger };
 static const struct snd_rawmidi_ops ns6_midi_out_ops = { .open = ns6_midi_out_open, .close = ns6_midi_out_close, .trigger = ns6_midi_out_trigger };
 
 /* ========================================================================= *
- * ALSA PCM CONFIG (TOTALMENTE BLINDADO AGORA)
+ * ALSA PCM CONFIG 
  * ========================================================================= */
 static const struct snd_pcm_hardware ns6_hw = {
     .info             = SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_BLOCK_TRANSFER | SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID | SNDRV_PCM_INFO_BATCH,
@@ -404,18 +479,17 @@ static int ns6_pcm_open(struct snd_pcm_substream *sub) {
     sub->runtime->hw = ns6_hw;
     snd_pcm_hw_constraint_step(sub->runtime, 0, SNDRV_PCM_HW_PARAM_PERIOD_SIZE, 176);
     snd_pcm_hw_constraint_step(sub->runtime, 0, SNDRV_PCM_HW_PARAM_BUFFER_SIZE, 176);
-    if (sub->stream == SNDRV_PCM_STREAM_PLAYBACK) ns6->play.substream = sub; else ns6->cap.substream = sub;
+    ns6->play.substream = sub; 
     return 0;
 }
 
 static int ns6_pcm_close(struct snd_pcm_substream *sub) {
     struct ns6 *ns6 = snd_pcm_substream_chip(sub);
     unsigned long flags;
-    struct ns6_stream *s = (sub->stream == SNDRV_PCM_STREAM_PLAYBACK) ? &ns6->play : &ns6->cap;
     
-    spin_lock_irqsave(&s->lock, flags);
-    s->substream = NULL;
-    spin_unlock_irqrestore(&s->lock, flags);
+    spin_lock_irqsave(&ns6->play.lock, flags);
+    ns6->play.substream = NULL;
+    spin_unlock_irqrestore(&ns6->play.lock, flags);
     return 0;
 }
 
@@ -423,128 +497,90 @@ static int ns6_pcm_hw_params(struct snd_pcm_substream *sub, struct snd_pcm_hw_pa
 
 static int ns6_pcm_hw_free(struct snd_pcm_substream *sub) { 
     struct ns6 *ns6 = snd_pcm_substream_chip(sub);
-    struct ns6_stream *s = (sub->stream == SNDRV_PCM_STREAM_PLAYBACK) ? &ns6->play : &ns6->cap;
+    struct ns6_stream *s = &ns6->play;
     unsigned long flags;
     int i;
     
-    /* Cortamos a força dos cabos e matamos os URBs pacificamente */
     spin_lock_irqsave(&s->lock, flags);
     s->active_usb = false; 
     s->active_pcm = false;
-    
-    /* TRUQUE DO RELÓGIO: Se parou o Playback, desliga também o "Respirador" da entrada */
-    if (sub->stream == SNDRV_PCM_STREAM_PLAYBACK) {
-        ns6->cap.active_usb = false;
-    }
+    ns6->sync_active = false;
     spin_unlock_irqrestore(&s->lock, flags);
 
     for (i = 0; i < NS6_NURBS; i++) {
-        if (s->urbs[i]) {
-            usb_kill_urb(s->urbs[i]);
-        }
-        /* Mata os URBs do respirador invisível junto com a música */
-        if (sub->stream == SNDRV_PCM_STREAM_PLAYBACK && ns6->cap.urbs[i]) {
-            usb_kill_urb(ns6->cap.urbs[i]);
-        }
+        if (s->urbs[i]) usb_kill_urb(s->urbs[i]);
+        if (ns6->sync_urbs[i]) usb_kill_urb(ns6->sync_urbs[i]);
     }
     return 0; 
 }
 
 static int ns6_pcm_prepare(struct snd_pcm_substream *sub) {
     struct ns6 *ns6 = snd_pcm_substream_chip(sub);
-    struct ns6_stream *s = (sub->stream == SNDRV_PCM_STREAM_PLAYBACK) ? &ns6->play : &ns6->cap;
+    struct ns6_stream *s = &ns6->play;
     unsigned long flags;
     int i, j, err;
-    int success_count = 0;
 
     spin_lock_irqsave(&s->lock, flags);
+    
+    /* FIX DO CLAUDE: Zera TUDO no ALSA ao trocar de música para evitar Slip! */
     s->hwptr = 0; 
     s->period_pos = 0; 
+    s->frac_acc = 0;
     
-    /* Só zera a fase e o warm-up se for uma partida fria (USB desligado)
-     * Isso impede que o relógio dê solavancos quando mudamos de música! */
     if (!s->active_usb) {
-        s->phase = 0;
+        s->frac_num = NS6_RATE; 
         s->warmup_cnt = 50; 
+    } else {
+        s->warmup_cnt = 0; 
     }
     spin_unlock_irqrestore(&s->lock, flags);
 
     if (!s->active_usb) {
         s->active_usb = true;
         
-        /* ==================================================================== *
-         * TRUQUE DO RELÓGIO (ANTI-DRIFT E ANTI-OVERFLOW):
-         * Se ligarmos a Saída (Playback), ativamos a Entrada (Capture) 
-         * silenciosamente no fundo. Isso esvazia o buffer interno do chip da NS6,
-         * sincroniza o USB e impede que o áudio estoure aos 4 minutos!
-         * ==================================================================== */
-        if (sub->stream == SNDRV_PCM_STREAM_PLAYBACK && !ns6->cap.active_usb) {
-            ns6->cap.active_usb = true;
+        if (!ns6->sync_active && ns6->ep_sync) {
+            ns6->sync_active = true;
             for (i = 0; i < NS6_NURBS; i++) {
-                if (ns6->cap.urbs[i]) {
-                    /* Limpa a memória antes de enviar para não estourar o buffer */
-                    memset(ns6->cap.urbs[i]->transfer_buffer, 0, ns6->cap.urbs[i]->transfer_buffer_length);
-                    usb_submit_urb(ns6->cap.urbs[i], GFP_KERNEL);
+                if (ns6->sync_urbs[i]) {
+                    memset(ns6->sync_bufs[i], 0, NS6_SYNC_URB_BYTES);
+                    usb_submit_urb(ns6->sync_urbs[i], GFP_KERNEL);
                 }
             }
         }
 
         for (i = 0; i < NS6_NURBS; i++) {
             if (s->urbs[i]) {
-                
-                /* O SEGREDO E A PROTEÇÃO: 
-                 * A formatação matemática avançada só se aplica à SAÍDA (Playback) */
-                if (sub->stream == SNDRV_PCM_STREAM_PLAYBACK) {
-                    unsigned int total_bytes = 0;
-                    for (j = 0; j < s->urbs[i]->number_of_packets; j++) {
-                        unsigned int pk_frames = 5; 
-                        s->phase += 41;          
-                        if (s->phase >= 80) { pk_frames += 1; s->phase -= 80; }
-                        unsigned int pk_bytes = pk_frames * NS6_FRAME_BYTES;
-                        
-                        s->urbs[i]->iso_frame_desc[j].offset = total_bytes;
-                        s->urbs[i]->iso_frame_desc[j].length = pk_bytes;
-                        total_bytes += pk_bytes;
-                    }
-                    memset(s->urbs[i]->transfer_buffer, 0, total_bytes);
-                } else {
-                    /* Para ENTRADA (Capture), o hardware decide. Nós apenas limpamos 
-                     * o tamanho exato da memória sem vazar pelo teto (Anti-Overflow) */
-                    memset(s->urbs[i]->transfer_buffer, 0, s->urbs[i]->transfer_buffer_length);
+                unsigned int total_bytes = 0;
+                for (j = 0; j < s->urbs[i]->number_of_packets; j++) {
+                    s->frac_acc += s->frac_num;
+                    unsigned int pk_frames = s->frac_acc / 8000;
+                    s->frac_acc %= 8000;
+                    unsigned int pk_bytes = pk_frames * NS6_FRAME_BYTES;
+                    if (pk_bytes > NS6_PKT_SIZE) pk_bytes = NS6_PKT_SIZE;
+                    
+                    s->urbs[i]->iso_frame_desc[j].offset = total_bytes;
+                    s->urbs[i]->iso_frame_desc[j].length = pk_bytes;
+                    total_bytes += pk_bytes;
                 }
+                memset(s->urbs[i]->transfer_buffer, 0, NS6_URB_BYTES);
 
-                /* Agora sim enviamos um pacote limpo para a porta USB */
                 err = usb_submit_urb(s->urbs[i], GFP_KERNEL);
                 if (err) {
-                    pr_err("NS6: Erro ao submeter URB %d no %s (%d)\n", 
-                           i, (sub->stream == SNDRV_PCM_STREAM_PLAYBACK) ? "Playback" : "Capture", err);
                     s->active_usb = false; 
                     return err;
                 }
-                success_count++;
             }
         }
-        
-        if (success_count > 0) {
-            pr_info("NS6: Motor de %s iniciado com %d URBs (Sincronia 44.1kHz OK)\n",
-                    (sub->stream == SNDRV_PCM_STREAM_PLAYBACK) ? "Saida" : "Entrada", 
-                    success_count);
-        }
-    } else {
-        pr_debug("NS6: %s re-preparado (USB ja estava ativo)\n",
-                 (sub->stream == SNDRV_PCM_STREAM_PLAYBACK) ? "Playback" : "Capture");
-    }
+    } 
 
     return 0;
 }
 
-
 static int ns6_pcm_trigger(struct snd_pcm_substream *sub, int cmd) {
     struct ns6 *ns6 = snd_pcm_substream_chip(sub);
-    struct ns6_stream *s = (sub->stream == SNDRV_PCM_STREAM_PLAYBACK) ? &ns6->play : &ns6->cap;
+    struct ns6_stream *s = &ns6->play;
     unsigned long flags;
     
-    /* Trigger atômico (Gatilho ultra-rápido): Apenas libera o fluxo do som! */
     switch (cmd) {
     case SNDRV_PCM_TRIGGER_START:
         spin_lock_irqsave(&s->lock, flags); 
@@ -562,7 +598,7 @@ static int ns6_pcm_trigger(struct snd_pcm_substream *sub, int cmd) {
 
 static snd_pcm_uframes_t ns6_pcm_pointer(struct snd_pcm_substream *sub) {
     struct ns6 *ns6 = snd_pcm_substream_chip(sub);
-    return (sub->stream == SNDRV_PCM_STREAM_PLAYBACK) ? ns6->play.hwptr : ns6->cap.hwptr;
+    return ns6->play.hwptr;
 }
 
 static const struct snd_pcm_ops ns6_pcm_ops = {
@@ -579,14 +615,12 @@ static int ns6_alloc_iso_urbs(struct ns6 *ns6, struct ns6_stream *s, struct usb_
     
     u8 ep = epd->bEndpointAddress;
     unsigned int pipe = (ep & USB_DIR_IN) ? usb_rcvisocpipe(ns6->udev, ep & 0x7f) : usb_sndisocpipe(ns6->udev, ep & 0x7f);
-    unsigned int pkt_size = (ep == NS6_EP_PLAY) ? NS6_PKT_SIZE : (NS6_FRAME_BYTES * 5); 
-    unsigned int urb_bytes = NS6_PKTS_PER_URB * pkt_size;
 
     for (i = 0; i < NS6_NURBS; i++) {
         s->urbs[i] = usb_alloc_urb(NS6_PKTS_PER_URB, GFP_KERNEL);
         if (!s->urbs[i]) return -ENOMEM;
 
-        s->bufs[i] = usb_alloc_coherent(ns6->udev, urb_bytes, GFP_KERNEL, &s->dma[i]);
+        s->bufs[i] = usb_alloc_coherent(ns6->udev, NS6_URB_BYTES, GFP_KERNEL, &s->dma[i]);
         if (!s->bufs[i]) return -ENOMEM;
 
         s->urbs[i]->dev = ns6->udev;
@@ -596,29 +630,26 @@ static int ns6_alloc_iso_urbs(struct ns6 *ns6, struct ns6_stream *s, struct usb_
         s->urbs[i]->transfer_dma = s->dma[i];
         s->urbs[i]->transfer_flags = URB_ISO_ASAP | URB_NO_TRANSFER_DMA_MAP;
 
-        s->urbs[i]->transfer_buffer_length = urb_bytes;
+        s->urbs[i]->transfer_buffer_length = NS6_URB_BYTES;
         s->urbs[i]->number_of_packets = NS6_PKTS_PER_URB;
         s->urbs[i]->complete = cb;
         s->urbs[i]->context = ns6;
         s->urbs[i]->interval = 1;
 
         for (j = 0; j < NS6_PKTS_PER_URB; j++) {
-            s->urbs[i]->iso_frame_desc[j].offset = j * pkt_size;
-            s->urbs[i]->iso_frame_desc[j].length = pkt_size;
+            s->urbs[i]->iso_frame_desc[j].offset = j * NS6_PKT_SIZE;
+            s->urbs[i]->iso_frame_desc[j].length = NS6_PKT_SIZE;
         }
     }
     return 0;
 }
 
-static void ns6_free_iso_urbs(struct ns6 *ns6, struct ns6_stream *s, u8 ep) {
+static void ns6_free_iso_urbs(struct ns6 *ns6, struct ns6_stream *s) {
     int i;
-    unsigned int pkt_size = (ep == NS6_EP_PLAY) ? NS6_PKT_SIZE : (NS6_FRAME_BYTES * 5); 
-    unsigned int urb_bytes = NS6_PKTS_PER_URB * pkt_size;
-
     for (i = 0; i < NS6_NURBS; i++) {
         if (s->urbs[i]) {
             usb_kill_urb(s->urbs[i]);
-            if (s->bufs[i]) usb_free_coherent(ns6->udev, urb_bytes, s->bufs[i], s->dma[i]);
+            if (s->bufs[i]) usb_free_coherent(ns6->udev, NS6_URB_BYTES, s->bufs[i], s->dma[i]);
             usb_free_urb(s->urbs[i]); s->urbs[i] = NULL;
         }
     }
@@ -632,7 +663,7 @@ static int ns6_probe(struct usb_interface *intf, const struct usb_device_id *id)
     struct ns6 *ns6;
     struct snd_card *card;
     struct snd_pcm *pcm;
-    int i, err;
+    int i, j, err;
 
     if (intf->cur_altsetting->desc.bInterfaceNumber != 0) return -ENODEV;
 
@@ -646,7 +677,6 @@ static int ns6_probe(struct usb_interface *intf, const struct usb_device_id *id)
     usb_set_intfdata(intf, ns6);
 
     spin_lock_init(&ns6->play.lock);
-    spin_lock_init(&ns6->cap.lock);
     spin_lock_init(&ns6->midi_out_lock);
 
     strscpy(card->driver, DRV_NAME, sizeof(card->driver));
@@ -654,21 +684,48 @@ static int ns6_probe(struct usb_interface *intf, const struct usb_device_id *id)
     strscpy(card->longname, "Numark NS6 DJ Controller");
 
     ns6->ep_play = ns6_get_ep_desc(udev, NS6_EP_PLAY);
-    ns6->ep_cap  = ns6_get_ep_desc(udev, NS6_EP_CAP);
     ns6->ep_midi_in = ns6_get_ep_desc(udev, NS6_EP_MIDI_IN);
     ns6->ep_midi_out = ns6_get_ep_desc(udev, NS6_EP_MIDI_OUT);
 
-    if (!ns6->ep_midi_in || !ns6->ep_midi_out) {
-        pr_err("NS6: Faltam endpoints MIDI! Verifique o hardware.\n");
-        err = -ENODEV;
-        goto err_free_card;
+    ns6->intf1 = usb_ifnum_to_if(udev, 1);
+    if (ns6->intf1) {
+        err = usb_driver_claim_interface(&ns6_driver, ns6->intf1, ns6);
+        if (!err) {
+            usb_set_interface(udev, 1, 1);
+            ns6->ep_sync = ns6_get_ep_desc(udev, NS6_EP_SYNC);
+        }
     }
 
     err = ns6_alloc_iso_urbs(ns6, &ns6->play, ns6->ep_play, ns6_play_urb_cb);
     if (err) goto err_free_play;
 
-    err = ns6_alloc_iso_urbs(ns6, &ns6->cap, ns6->ep_cap, ns6_cap_urb_cb);
-    if (err) goto err_free_cap;
+    if (ns6->ep_sync) {
+        for (i = 0; i < NS6_NURBS; i++) {
+            ns6->sync_urbs[i] = usb_alloc_urb(NS6_SYNC_PKTS_PER_URB, GFP_KERNEL);
+            if (!ns6->sync_urbs[i]) { err = -ENOMEM; goto err_free_sync; }
+
+            ns6->sync_bufs[i] = usb_alloc_coherent(udev, NS6_SYNC_URB_BYTES, GFP_KERNEL, &ns6->sync_dma[i]);
+            if (!ns6->sync_bufs[i]) { err = -ENOMEM; goto err_free_sync; }
+
+            ns6->sync_urbs[i]->dev = udev;
+            ns6->sync_urbs[i]->pipe = usb_rcvisocpipe(udev, NS6_EP_SYNC);
+            ns6->sync_urbs[i]->transfer_buffer = ns6->sync_bufs[i];
+            ns6->sync_urbs[i]->transfer_dma = ns6->sync_dma[i];
+            ns6->sync_urbs[i]->transfer_flags = URB_ISO_ASAP | URB_NO_TRANSFER_DMA_MAP;
+            ns6->sync_urbs[i]->transfer_buffer_length = NS6_SYNC_URB_BYTES;
+            ns6->sync_urbs[i]->number_of_packets = NS6_SYNC_PKTS_PER_URB;
+            ns6->sync_urbs[i]->complete = ns6_sync_urb_cb;
+            ns6->sync_urbs[i]->context = ns6;
+            
+            /* O Intervalo revelado pelo LSUSB */
+            ns6->sync_urbs[i]->interval = 1 << (ns6->ep_sync->bInterval - 1); 
+
+            for (j = 0; j < NS6_SYNC_PKTS_PER_URB; j++) {
+                ns6->sync_urbs[i]->iso_frame_desc[j].offset = j * NS6_SYNC_PKT_SIZE;
+                ns6->sync_urbs[i]->iso_frame_desc[j].length = NS6_SYNC_PKT_SIZE;
+            }
+        }
+    }
 
     for (i = 0; i < NS6_MIDI_NURBS; i++) {
         ns6->midi_in_urbs[i] = usb_alloc_urb(0, GFP_KERNEL);
@@ -684,17 +741,19 @@ static int ns6_probe(struct usb_interface *intf, const struct usb_device_id *id)
         usb_submit_urb(ns6->midi_in_urbs[i], GFP_KERNEL);
     }
 
-    ns6->midi_out_urb = usb_alloc_urb(0, GFP_KERNEL);
-    if (!ns6->midi_out_urb) { err = -ENOMEM; goto err_free_midi; }
+    for (i = 0; i < NS6_MIDI_OUT_NURBS; i++) {
+        ns6->midi_out_urbs[i] = usb_alloc_urb(0, GFP_KERNEL);
+        if (!ns6->midi_out_urbs[i]) { err = -ENOMEM; goto err_free_midi; }
+    }
 
-    err = snd_pcm_new(card, "NS6 Audio", 0, 1, 1, &pcm);
+    /* Agora pedimos ao ALSA 1 Playback e 0 Capturas! (Remoção da Captura Fake) */
+    err = snd_pcm_new(card, "NS6 Audio", 0, 1, 0, &pcm); 
     if (err) goto err_free_pcm;
 
     ns6->pcm = pcm;
     pcm->private_data = ns6;
     strscpy(pcm->name, "Numark NS6");
     snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK, &ns6_pcm_ops);
-    snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE, &ns6_pcm_ops);
     snd_pcm_set_managed_buffer_all(pcm, SNDRV_DMA_TYPE_VMALLOC, NULL, 0, 0);
 
     err = snd_rawmidi_new(card, "NS6 MIDI", 0, 1, 1, &ns6->rmidi);
@@ -715,16 +774,27 @@ static int ns6_probe(struct usb_interface *intf, const struct usb_device_id *id)
     return 0;
 
 err_free_pcm:
-    if (ns6->midi_out_urb) { usb_kill_urb(ns6->midi_out_urb); usb_free_urb(ns6->midi_out_urb); }
+    for (i = 0; i < NS6_MIDI_OUT_NURBS; i++) {
+        if (ns6->midi_out_urbs[i]) { usb_kill_urb(ns6->midi_out_urbs[i]); usb_free_urb(ns6->midi_out_urbs[i]); }
+    }
 err_free_midi:
     for (i = 0; i < NS6_MIDI_NURBS; i++) {
         if (ns6->midi_in_urbs[i]) { usb_kill_urb(ns6->midi_in_urbs[i]); usb_free_urb(ns6->midi_in_urbs[i]); }
     }
-err_free_cap:
-    ns6_free_iso_urbs(ns6, &ns6->cap, NS6_EP_CAP);
+err_free_sync:
+    for (i = 0; i < NS6_NURBS; i++) {
+        if (ns6->sync_urbs[i]) {
+            usb_kill_urb(ns6->sync_urbs[i]);
+            if (ns6->sync_bufs[i]) usb_free_coherent(ns6->udev, NS6_SYNC_URB_BYTES, ns6->sync_bufs[i], ns6->sync_dma[i]);
+            usb_free_urb(ns6->sync_urbs[i]);
+        }
+    }
 err_free_play:
-    ns6_free_iso_urbs(ns6, &ns6->play, NS6_EP_PLAY);
-err_free_card:
+    ns6_free_iso_urbs(ns6, &ns6->play);
+    if (ns6->intf1) {
+        usb_set_interface(ns6->udev, 1, 0);
+        usb_driver_release_interface(&ns6_driver, ns6->intf1);
+    }
     usb_set_intfdata(intf, NULL);
     snd_card_free(card);
     return err;
@@ -739,22 +809,43 @@ static void ns6_disconnect(struct usb_interface *intf) {
     cancel_work_sync(&ns6->init_work);
 
     ns6->play.active_usb = false;
-    ns6->cap.active_usb  = false;
+    ns6->sync_active     = false;
 
     for (i = 0; i < NS6_MIDI_NURBS; i++) {
         if (ns6->midi_in_urbs[i]) usb_kill_urb(ns6->midi_in_urbs[i]);
     }
-    if (ns6->midi_out_urb) usb_kill_urb(ns6->midi_out_urb);
+    for (i = 0; i < NS6_MIDI_OUT_NURBS; i++) {
+        if (ns6->midi_out_urbs[i]) usb_kill_urb(ns6->midi_out_urbs[i]);
+    }
+    
+    for (i = 0; i < NS6_NURBS; i++) {
+        if (ns6->sync_urbs[i]) usb_kill_urb(ns6->sync_urbs[i]);
+    }
 
     snd_card_free(ns6->card);
 
-    ns6_free_iso_urbs(ns6, &ns6->play, NS6_EP_PLAY);
-    ns6_free_iso_urbs(ns6, &ns6->cap, NS6_EP_CAP);
+    ns6_free_iso_urbs(ns6, &ns6->play);
+
+    for (i = 0; i < NS6_NURBS; i++) {
+        if (ns6->sync_urbs[i]) {
+            if (ns6->sync_bufs[i]) usb_free_coherent(ns6->udev, NS6_SYNC_URB_BYTES, ns6->sync_bufs[i], ns6->sync_dma[i]);
+            usb_free_urb(ns6->sync_urbs[i]);
+        }
+    }
 
     for (i = 0; i < NS6_MIDI_NURBS; i++) {
         if (ns6->midi_in_urbs[i]) usb_free_urb(ns6->midi_in_urbs[i]);
     }
-    if (ns6->midi_out_urb) usb_free_urb(ns6->midi_out_urb);
+    for (i = 0; i < NS6_MIDI_OUT_NURBS; i++) {
+        if (ns6->midi_out_urbs[i]) usb_free_urb(ns6->midi_out_urbs[i]);
+    }
+
+    if (ns6->intf1) {
+        struct usb_interface *i1 = ns6->intf1;
+        ns6->intf1 = NULL;
+        usb_set_interface(ns6->udev, 1, 0);
+        usb_driver_release_interface(&ns6_driver, i1);
+    }
 
     usb_set_intfdata(intf, NULL);
 }
@@ -769,4 +860,4 @@ static struct usb_driver ns6_driver = {
     .supports_autosuspend = 0, 
 };
 module_usb_driver(ns6_driver);
-MODULE_AUTHOR("ns6d project"); MODULE_DESCRIPTION("Numark NS6 complete USB driver"); MODULE_LICENSE("GPL v2");
+MODULE_AUTHOR("ns6d project"); MODULE_DESCRIPTION("Numark NS6 Masterpiece Driver"); MODULE_LICENSE("GPL v2");

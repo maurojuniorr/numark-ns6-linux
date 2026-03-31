@@ -15,8 +15,6 @@ __section(".gnu.linkonce.this_module") = {
 };
 
 
-MODULE_INFO(depends, "snd,snd-pcm");
+MODULE_INFO(depends, "snd-pcm,snd");
 
-MODULE_ALIAS("usb:v15E4p0079d*dc*dsc*dp*ic*isc*ip*in01*");
-
-MODULE_INFO(srcversion, "390450F04E5EBB000F8BAB3");
+MODULE_ALIAS("usb:v15E4p0079d*dc*dsc*dp*ic*isc*ip*in00*");
