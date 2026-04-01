@@ -5,293 +5,85 @@
 #include "ns6.h"
 
 /* ------------------------------------------------------------------ */
-/* Helpers internos                                                     */
+/* Sequência completa de init — Clone Exato do macOS                    */
 /* ------------------------------------------------------------------ */
 
-static int ctrl_out(libusb_device_handle *usb,
-                    uint8_t bmrt, uint8_t breq,
-                    uint16_t wval, uint16_t widx,
-                    uint8_t *data, uint16_t len)
-{
-    int r = libusb_control_transfer(usb, bmrt, breq, wval, widx,
-                                    data, len, 1000);
-    if (r < 0)
-        fprintf(stderr, "ctrl_out bmrt=0x%02x breq=%d: %s\n",
-                bmrt, breq, libusb_strerror(r));
-    return r;
-}
-
-static int ctrl_in(libusb_device_handle *usb,
-                   uint8_t bmrt, uint8_t breq,
-                   uint16_t wval, uint16_t widx,
-                   uint8_t *buf, uint16_t len)
-{
-    int r = libusb_control_transfer(usb, bmrt, breq, wval, widx,
-                                    buf, len, 1000);
-    if (r < 0)
-        fprintf(stderr, "ctrl_in bmrt=0x%02x breq=%d: %s\n",
-                bmrt, breq, libusb_strerror(r));
-    return r;
-}
-
-/* ------------------------------------------------------------------ */
-/* Passo 2 — Vendor capability query                                    */
-/* ------------------------------------------------------------------ */
-static int ns6_vendor_capability(libusb_device_handle *usb)
-{
-    uint8_t buf[8];
-    const uint8_t expected[] = { 0x31, 0x01, 0x03, 0x02, 0x02 };
-
-    /* Primeira leitura: descobre o tamanho */
-    int r = ctrl_in(usb, 0xC0, NS6_BREQ_VENDOR_CAP, 0, 0, buf, 8);
-    if (r < 0) return r;
-
-    /* Segunda leitura: lê com tamanho correto */
-    r = ctrl_in(usb, 0xC0, NS6_BREQ_VENDOR_CAP, 0, 0, buf, r);
-    if (r < 0) return r;
-
-    if (r < 5 || memcmp(buf, expected, 5) != 0) {
-        fprintf(stderr, "ns6: capability mismatch\n");
-        return -1;
-    }
-
-    printf("ns6: capability OK: %02x %02x %02x %02x %02x\n",
-           buf[0], buf[1], buf[2], buf[3], buf[4]);
-    return 0;
-}
-
-/* ------------------------------------------------------------------ */
-/* Passo 7/11 — Vendor mode query                                       */
-/* ------------------------------------------------------------------ */
-static int ns6_vendor_mode_get(libusb_device_handle *usb)
-{
-    uint8_t val = 0;
-    int r = ctrl_in(usb, 0xC0, NS6_BREQ_VENDOR_MODE, 0, 0, &val, 1);
-    if (r < 0) return r;
-
-    /* 0x12 = idle, 0x32 = already initialized (e.g. by snd-usb-audio) */
-    if (val != 0x12 && val != 0x32) {
-        fprintf(stderr, "ns6: vendor mode unexpected: 0x%02x\n", val);
-        return -1;
-    }
-    printf("ns6: vendor mode = 0x%02x OK\n", val);
-    return 0;
-}
-
-/* ------------------------------------------------------------------ */
-/* ------------------------------------------------------------------ */
-/* Passo 12 — Ativar modo operacional                                   */
-/* ------------------------------------------------------------------ */
-static int ns6_activate(libusb_device_handle *usb)
-{
-    int r = ctrl_out(usb, 0x40, NS6_BREQ_VENDOR_MODE,
-                     NS6_VENDOR_MODE_ACTIVATE, 0, NULL, 0);
-    if (r < 0) return r;
-    printf("ns6: device activated\n");
-    return 0;
-}
-
-/* ------------------------------------------------------------------ */
-/* Passo 13 — SysEx de identificação                                    */
-/* ------------------------------------------------------------------ */
-static int ns6_send_sysex(ns6_device_t *dev)
-{
-    uint8_t pkt[NS6_CTRL_PKT_SIZE];
-    memset(pkt, NS6_IDLE_BYTE, NS6_CTRL_PKT_SIZE);
-    pkt[NS6_CTRL_PKT_SIZE - 1] = NS6_PKT_TERMINATOR;
-
-    /* Copia SysEx nos primeiros bytes */
-    size_t len = NS6_SYSEX_INIT_LEN;
-    if (len > NS6_CTRL_PKT_SIZE - 1)
-        len = NS6_CTRL_PKT_SIZE - 1;
-    memcpy(pkt, NS6_SYSEX_INIT, len);
-
-    int transferred = 0;
-    int r = libusb_bulk_transfer(dev->usb, NS6_EP_CTRL_OUT,
-                                  pkt, NS6_CTRL_PKT_SIZE,
-                                  &transferred, 1000);
-    if (r < 0) {
-        fprintf(stderr, "ns6: sysex send failed: %s\n", libusb_strerror(r));
-        return r;
-    }
-    printf("ns6: SysEx sent (%d bytes)\n", transferred);
-    return 0;
-}
-
-/* ------------------------------------------------------------------ */
-/* Passo 14 — Burst de sincronização de estado inicial                  */
-/* ------------------------------------------------------------------ */
-static void build_init_pkt(uint8_t *pkt,
-                            uint8_t s0, uint8_t n0, uint8_t v0,
-                            uint8_t s1, uint8_t n1, uint8_t v1,
-                            uint8_t s2, uint8_t n2, uint8_t v2)
-{
-    memset(pkt, NS6_IDLE_BYTE, NS6_CTRL_PKT_SIZE);
-    pkt[0] = s0; pkt[1] = n0; pkt[2] = v0;
-    pkt[3] = s1; pkt[4] = n1; pkt[5] = v1;
-    pkt[6] = s2; pkt[7] = n2; pkt[8] = v2;
-    pkt[NS6_CTRL_PKT_SIZE - 1] = NS6_PKT_TERMINATOR;
-}
-
-static int send_pkt(ns6_device_t *dev, const uint8_t *pkt)
-{
-    int transferred = 0;
-    return libusb_bulk_transfer(dev->usb, NS6_EP_CTRL_OUT,
-                                 (uint8_t *)pkt, NS6_CTRL_PKT_SIZE,
-                                 &transferred, 1000);
-}
-
-static int ns6_send_init_state(ns6_device_t *dev)
-{
-    uint8_t pkt[NS6_CTRL_PKT_SIZE];
-
-    /*
-     * Envia estado inicial de todos os controles:
-     * EQs e gains no máximo (0x7F), volumes no máximo,
-     * crossfader no centro, botões desligados.
-     * Reproduz o burst observado na captura.
-     */
-
-    /* Deck 1: gain, high, mid */
-    build_init_pkt(pkt,
-        0xB0, NS6_CC_LSB_OF(NS6_CC_GAIN),  0x7F,   /* Gain Dk1 LSB  */
-        0xB0, NS6_CC_GAIN,                  0x7F,   /* Gain Dk1 MSB  */
-        0xB0, NS6_CC_LSB_OF(NS6_CC_HIGH),  0x7F);  /* High EQ Dk1 LSB */
-    send_pkt(dev, pkt);
-
-    /* Deck 1: high, mid, low */
-    build_init_pkt(pkt,
-        0xB0, NS6_CC_HIGH,                  0x7F,
-        0xB0, NS6_CC_LSB_OF(NS6_CC_MID),   0x7F,
-        0xB0, NS6_CC_MID,                   0x7F);
-    send_pkt(dev, pkt);
-
-    /* Deck 1: low, volume */
-    build_init_pkt(pkt,
-        0xB0, NS6_CC_LSB_OF(NS6_CC_LOW),   0x7F,
-        0xB0, NS6_CC_LOW,                   0x7F,
-        0xB0, NS6_CC_LSB_OF(NS6_CC_VOLUME),0x7F);
-    send_pkt(dev, pkt);
-
-    /* Deck 1: volume; Deck 2: low, mid, high, gain */
-    build_init_pkt(pkt,
-        0xB0, NS6_CC_VOLUME,                0x7F,
-        0xB0, NS6_CC_LSB_OF(NS6_CC_LOW)+5, 0x7F,   /* Low Dk2 LSB = 0x2E */
-        0xB0, NS6_CC_LOW+5,                 0x7F);  /* Low Dk2 MSB = 0x0E */
-    send_pkt(dev, pkt);
-
-    /* Deck 2: volume, gain, high, mid */
-    build_init_pkt(pkt,
-        0xB0, NS6_CC_VOLUME+5,              0x7F,   /* Vol Dk2 MSB = 0x0D */
-        0xB0, NS6_CC_LSB_OF(NS6_CC_VOLUME)+5, 0x7F,
-        0xB0, NS6_CC_GAIN+5,                0x7F);
-    send_pkt(dev, pkt);
-
-    /* Crossfader no centro */
-    build_init_pkt(pkt,
-        0xB0, NS6_CC_CROSSFADER,            0x40,   /* MSB centro */
-        0xB0, NS6_CC_LSB_OF(NS6_CC_CROSSFADER), 0x00,
-        NS6_IDLE_BYTE, NS6_IDLE_BYTE, NS6_IDLE_BYTE);
-    send_pkt(dev, pkt);
-
-    /* Todos os botões desligados */
-    build_init_pkt(pkt,
-        0x80, NS6_NOTE_PLAY,     0x00,   /* Play Dk1 OFF */
-        0x80, NS6_NOTE_CUE,      0x00,   /* Cue  Dk1 OFF */
-        0x82, NS6_NOTE_PLAY,     0x00);  /* Play Dk2 OFF */
-    send_pkt(dev, pkt);
-
-    build_init_pkt(pkt,
-        0x82, NS6_NOTE_CUE,      0x00,
-        0x83, NS6_NOTE_PLAY,     0x00,
-        0x83, NS6_NOTE_CUE,      0x00);
-    send_pkt(dev, pkt);
-
-    build_init_pkt(pkt,
-        0x84, NS6_NOTE_PLAY,     0x00,
-        0x84, NS6_NOTE_CUE,      0x00,
-        NS6_IDLE_BYTE, NS6_IDLE_BYTE, NS6_IDLE_BYTE);
-    send_pkt(dev, pkt);
-
-    printf("ns6: init state burst sent\n");
-    return 0;
-}
-
-/* ------------------------------------------------------------------ */
-/* Sequência completa de init — 14 passos                               */
-/* ------------------------------------------------------------------ */
 int ns6_init(ns6_device_t *dev)
 {
     libusb_device_handle *usb = dev->usb;
     int r;
+    uint8_t rate_pkt[] = { 0x44, 0xAC, 0x00 }; // 44100 Hz LE
+    uint8_t dummy_buf[4];
 
-    printf("ns6: starting init sequence...\n");
+    printf("ns6: Iniciando Boot Sequence (Clone macOS)...\n");
+    
+    /* Fase 1: Reset Limpo (Sem o reset físico que derruba o Linux!) */
+    // libusb_reset_device(usb);  <--- COMENTADO PARA EVITAR O CRASH SILENCIOSO
+    usleep(300000); 
+    libusb_detach_kernel_driver(usb, 0);
+    libusb_detach_kernel_driver(usb, 1);
 
-    /* Passo 1 — SET_CONFIGURATION 1
-     * Se o kernel module de áudio estiver ativo, pula — ele já configurou */
-    /* Passo 1 — Claim interface 0 apenas (interface 1 com snd-usb-audio) */
+    /* Fase 2: Configuração e Interfaces */
     r = libusb_claim_interface(usb, 0);
     if (r < 0) {
-        fprintf(stderr, "ns6: claim interface 0: %s\n", libusb_strerror(r));
+        fprintf(stderr, "ns6: Erro ao pedir Interface 0: %s\n", libusb_strerror(r));
         return r;
     }
-
-    /* Passo 2 — Vendor capability query */
-    r = ns6_vendor_capability(usb);
-    if (r < 0) return r;
-
-    /* Passo 3 — SET_INTERFACE 0 alt=1 */
-    r = libusb_set_interface_alt_setting(usb, 0, 1);
-    if (r < 0) {
-        fprintf(stderr, "ns6: set_interface 0,1: %s\n", libusb_strerror(r));
-        return r;
-    }
-    printf("ns6: interface 0 alt=1 OK\n");
-
-    /* Interface 1 precisa de alt=1 para o MIDI funcionar.
-     * Claimamos temporariamente só para setar, depois liberamos
-     * para o snd-usb-audio/snd-ns6-audio usar. */
+    libusb_set_interface_alt_setting(usb, 0, 1);
+    
     r = libusb_claim_interface(usb, 1);
     if (r == 0) {
         libusb_set_interface_alt_setting(usb, 1, 1);
-        libusb_release_interface(usb, 1);
-        printf("ns6: interface 1 alt=1 OK (released)\n");
     } else {
-        printf("ns6: interface 1 already claimed by kernel driver (OK)\n");
+        fprintf(stderr, "ns6: Aviso ao pedir Interface 1: %s\n", libusb_strerror(r));
     }
 
-    /* Passo 4 — CLEAR_FEATURE nos endpoints MIDI */
-    libusb_clear_halt(usb, NS6_EP_WAVEFORM);
-    libusb_clear_halt(usb, NS6_EP_CTRL_OUT);
-    libusb_clear_halt(usb, NS6_EP_CTRL_IN);
-    printf("ns6: endpoints cleared\n");
+    /* Limpa HALT (Como o macOS faz) */
+    libusb_clear_halt(usb, 0x02);
+    libusb_clear_halt(usb, 0x83);
+    libusb_clear_halt(usb, 0x86);
 
-    /* Passo 5 — Vendor mode query */
-    r = ns6_vendor_mode_get(usb);
-    if (r < 0) return r;
+    /* Fase 3: Consultas Iniciais */
+    // Vendor bReq=73 GET
+    libusb_control_transfer(usb, 0xC0, 73, 0x0000, 0, dummy_buf, 4, 1000);
+    // GET_CUR sample rate (wIdx=0)
+    libusb_control_transfer(usb, 0xA2, 0x81, 0x0100, 0, dummy_buf, 3, 1000);
 
-    printf("ns6: sample rate config skipped (snd-usb-audio)\n");
+    /* Fase 4: O SEGREDO DO macOS - Set Sample Rate DUPLO */
+    printf("ns6: Configurando Clock (Waveform + Audio)...\n");
+    // 1. Configura Waveform (EP 0x86 / 134)
+    r = libusb_control_transfer(usb, 0x22, 0x01, 0x0100, 134, rate_pkt, 3, 1000);
+    // 2. Configura Audio OUT (EP 0x02 / 2)
+    r = libusb_control_transfer(usb, 0x22, 0x01, 0x0100, 2, rate_pkt, 3, 1000);
 
-    /* Passo 6 — Vendor mode query (confirmação) */
-    r = ns6_vendor_mode_get(usb);
-    if (r < 0) return r;
+    /* Fase 5: Ativação do Modo DJ */
+    libusb_control_transfer(usb, 0xC0, 73, 0x0000, 0, dummy_buf, 4, 1000); // Re-check
+    r = libusb_control_transfer(usb, 0x40, 73, 0x0032, 0, NULL, 0, 1000);  // SET Mode 50
+    usleep(1000); // Pequena pausa (0.5ms no macOS)
 
-    /* Passo 7 — Ativar modo operacional */
-    r = ns6_activate(usb);
-    if (r < 0) return r;
+    if (r >= 0) {
+        printf("ns6: Hardware Boot OK!\n");
+    } else {
+        fprintf(stderr, "ns6: Erro no boot sequence.\n");
+    }
 
-    /* Passo 8 — SysEx de identificação */
-    r = ns6_send_sysex(dev);
-    if (r < 0) return r;
+    /* SysEx de Inicialização das Luzes */
+    uint8_t sysex_init[] = {
+        0xF0, 0x00, 0x01, 0x3F, 0x00, 0x79, 0x51, 0x00,
+        0x10, 0x49, 0x01, 0x08, 0x01, 0x01, 0x08, 0x04,
+        0x0C, 0x0D, 0x01, 0x0A, 0x0A, 0x05, 0x06, 0x05,
+        0x0D, 0x07, 0x0E, 0x08, 0x07, 0x0D, 0xF7
+    };
+    uint8_t pkt[NS6_CTRL_PKT_SIZE];
+    memset(pkt, NS6_IDLE_BYTE, NS6_CTRL_PKT_SIZE);
+    memcpy(pkt, sysex_init, sizeof(sysex_init));
+    pkt[NS6_CTRL_PKT_SIZE - 1] = NS6_PKT_TERMINATOR;
 
-    /* Passo 9 — Burst de sincronização de estado */
-    r = ns6_send_init_state(dev);
-    if (r < 0) return r;
+    int transferred = 0;
+    libusb_bulk_transfer(usb, NS6_EP_CTRL_OUT, pkt, NS6_CTRL_PKT_SIZE, &transferred, 2000);
 
-    printf("ns6: init complete!\n");
     return 0;
 }
-
 /* ------------------------------------------------------------------ */
 /* Parse de pacote MIDI de 42 bytes                                     */
 /* ------------------------------------------------------------------ */

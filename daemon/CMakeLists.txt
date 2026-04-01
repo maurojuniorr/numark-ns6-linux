@@ -20,6 +20,7 @@ add_executable(ns6d
     src/main.c
     src/usb.c
     src/protocol.c
+    src/audio.c   # <-- ADICIONE ESTA LINHA!
 )
 
 target_include_directories(ns6d PRIVATE

@@ -14,49 +14,56 @@
 /* ------------------------------------------------------------------ */
 /* USB Endpoints                                                        */
 /* ------------------------------------------------------------------ */
-#define NS6_EP_CTRL_IN          0x83   /* BULK IN  - MIDI control (device→host) */
-#define NS6_EP_CTRL_OUT         0x04   /* BULK OUT - MIDI/LEDs   (host→device)  */
-#define NS6_EP_WAVEFORM         0x86   /* BULK IN  - waveform display (descartado) */
+#define NS6_EP_CTRL_IN          0x83
+#define NS6_EP_CTRL_OUT         0x04
+#define NS6_EP_WAVEFORM         0x86
+
+#define NS6_EP_PLAY             0x02
+#define NS6_EP_SYNC             0x81
 
 /* ------------------------------------------------------------------ */
-/* Packet sizes                                                         */
+/* Packet sizes & USB URB definitions                                   */
 /* ------------------------------------------------------------------ */
-#define NS6_CTRL_PKT_SIZE       42     /* MIDI packed packet */
-#define NS6_WAVEFORM_PKT_SIZE   10240  /* waveform stream    */
-#define NS6_IDLE_BYTE           0xFD   /* unused slot filler */
-#define NS6_PKT_TERMINATOR      0x00   /* end of packet      */
+#define NS6_CTRL_PKT_SIZE       42
+#define NS6_WAVEFORM_PKT_SIZE   10240
+#define NS6_IDLE_BYTE           0xFD
+#define NS6_PKT_TERMINATOR      0x00
+
+#define NS6_PLAY_PKTS_PER_URB   32
+#define NS6_PLAY_PKT_SIZE       156
+#define NS6_FRAME_BYTES         12
+
+#define NS6_SYNC_PKTS_PER_URB   16
+#define NS6_SYNC_PKT_SIZE       64
 
 /* ------------------------------------------------------------------ */
 /* MIDI channels                                                        */
 /* ------------------------------------------------------------------ */
-#define NS6_CH_GLOBAL           0  /* crossfader, master, booth, layer */
-#define NS6_CH_DECK1            1  /* deck 1 — layer OFF, lado esquerdo */
-#define NS6_CH_DECK2            2  /* deck 2 — layer OFF, lado direito  */
-#define NS6_CH_DECK3            3  /* deck 3 — layer ON,  lado esquerdo */
-#define NS6_CH_DECK4            4  /* deck 4 — layer ON,  lado direito  */
+#define NS6_CH_GLOBAL           0
+#define NS6_CH_DECK1            1
+#define NS6_CH_DECK2            2
+#define NS6_CH_DECK3            3
+#define NS6_CH_DECK4            4
 
 /* ------------------------------------------------------------------ */
-/* CC numbers — MSB; LSB = MSB + 0x20                                  */
+/* CC numbers                                                           */
 /* ------------------------------------------------------------------ */
 #define NS6_CC_LSB_OFFSET       0x20
 
-/* Global (canal 0) */
 #define NS6_CC_CROSSFADER       0x07
 #define NS6_CC_MASTER_VOL       0x1B
 #define NS6_CC_BOOTH_VOL        0x1C
 #define NS6_CC_HP_VOL           0x19
 #define NS6_CC_HP_MIX           0x1A
 
-/* Por deck (canais 1-4) */
 #define NS6_CC_VOLUME           0x08
 #define NS6_CC_LOW              0x09
 #define NS6_CC_MID              0x0A
 #define NS6_CC_HIGH             0x0B
 #define NS6_CC_GAIN             0x0C
 #define NS6_CC_PITCH            0x13
-#define NS6_CC_JOG              0x00   /* MSB — LSB = 0x20 */
+#define NS6_CC_JOG              0x00
 
-/* Helpers 14-bit */
 #define NS6_CC_IS_MSB(cc)       ((cc) < 0x20)
 #define NS6_CC_IS_LSB(cc)       ((cc) >= 0x20 && (cc) < 0x40)
 #define NS6_CC_MSB_OF(lsb)      ((lsb) - NS6_CC_LSB_OFFSET)
@@ -71,18 +78,15 @@
 #define NS6_NOTE_SYNC           0x12
 #define NS6_NOTE_0x0E           0x0E
 #define NS6_NOTE_JOG_TOUCH      0x2C
-#define NS6_NOTE_LAYER_LEFT     0x04   /* canal 0 — deck 1↔3 */
-#define NS6_NOTE_LAYER_RIGHT    0x05   /* canal 0 — deck 2↔4 */
+#define NS6_NOTE_LAYER_LEFT     0x04
+#define NS6_NOTE_LAYER_RIGHT    0x05
 
-/* Knob de navegação (canal 0, CC 0x44, relativo) */
 #define NS6_CC_NAV_KNOB         0x44
-
-/* Strip search (canal 1-4, CC 0x02 — simples 7-bit, não par 14-bit) */
 #define NS6_CC_STRIP            0x02
 #define NS6_CC_IS_SINGLE(cc)    ((cc) == NS6_CC_STRIP)
 
 /* ------------------------------------------------------------------ */
-/* Vendor/Class requests (init sequence)                                */
+/* Vendor/Class requests                                                */
 /* ------------------------------------------------------------------ */
 #define NS6_BREQ_VENDOR_CAP      86
 #define NS6_BREQ_VENDOR_MODE     73
@@ -101,7 +105,7 @@ static const uint8_t NS6_SYSEX_INIT[] = {
 #define NS6_SYSEX_INIT_LEN (sizeof(NS6_SYSEX_INIT))
 
 /* ------------------------------------------------------------------ */
-/* Estado do jog wheel                                                  */
+/* Jog wheel state                                                      */
 /* ------------------------------------------------------------------ */
 typedef struct {
     bool     touch;
@@ -112,7 +116,7 @@ typedef struct {
 } ns6_jog_t;
 
 /* ------------------------------------------------------------------ */
-/* Estado completo da controladora                                      */
+/* Controller state                                                     */
 /* ------------------------------------------------------------------ */
 typedef struct {
     ns6_jog_t jog[4];
@@ -135,7 +139,7 @@ typedef struct {
 } ns6_state_t;
 
 /* ------------------------------------------------------------------ */
-/* Handle principal do daemon                                           */
+/* Device handle                                                        */
 /* ------------------------------------------------------------------ */
 typedef struct ns6_device ns6_device_t;
 
@@ -148,25 +152,32 @@ struct ns6_device {
                        uint8_t status, uint8_t note, uint8_t value);
 
     bool  running;
-    bool  no_audio;   /* sempre true — áudio com snd-usb-audio */
+    bool  no_audio;
     void *priv;
 };
 
 /* ------------------------------------------------------------------ */
-/* API pública                                                          */
+/* Public API                                                           */
 /* ------------------------------------------------------------------ */
 ns6_device_t *ns6_open(void);
 int           ns6_init(ns6_device_t *dev);
 int           ns6_run(ns6_device_t *dev);
 void          ns6_close(ns6_device_t *dev);
 
-int  ns6_send_midi(ns6_device_t *dev,
-                   uint8_t status, uint8_t note, uint8_t value);
+/* MIDI */
+int  ns6_send_midi(ns6_device_t *dev, uint8_t status, uint8_t note, uint8_t value);
 void ns6_midi_out_wake(void);
 void *ns6_midi_out_worker(void *arg);
 
+/* Protocol */
 void ns6_parse_packet(ns6_device_t *dev, const uint8_t *pkt);
-
 extern int ns6_debug_raw;
+
+/* Audio */
+int  ns6_audio_init(ns6_device_t *dev);
+void ns6_audio_stop(void);
+int  ns6_audio_pull_playback(uint8_t *iso_buf, int max_bytes);
+void ns6_audio_pump(void);
+int  ns6_audio_ring_fill(void);
 
 #endif /* NS6_H */
