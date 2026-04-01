@@ -1,5 +1,7 @@
 file(REMOVE_RECURSE
   "CMakeFiles/ns6d.dir/link.d"
+  "CMakeFiles/ns6d.dir/src/audio.c.o"
+  "CMakeFiles/ns6d.dir/src/audio.c.o.d"
   "CMakeFiles/ns6d.dir/src/main.c.o"
   "CMakeFiles/ns6d.dir/src/main.c.o.d"
   "CMakeFiles/ns6d.dir/src/protocol.c.o"

@@ -4,7 +4,7 @@
 # compile C with /usr/bin/cc
 C_DEFINES = 
 
-C_INCLUDES = -I/usr/include/libusb-1.0 -I"/home/joaobatista/Documentos/Numark NS6 Daemon/src"
+C_INCLUDES = -I/usr/include/libusb-1.0 -I/home/mauro/Documentos/numark-ns6-linux/daemon/src
 
 C_FLAGS = -std=gnu11 -Wall -Wextra -Wpedantic -O2
 

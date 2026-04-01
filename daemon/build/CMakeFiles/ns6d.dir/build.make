@@ -53,10 +53,10 @@ RM = /usr/bin/cmake -E rm -f
 EQUALS = =
 
 # The top-level source directory on which CMake was run.
-CMAKE_SOURCE_DIR = "/home/joaobatista/Documentos/Numark NS6 Daemon"
+CMAKE_SOURCE_DIR = /home/mauro/Documentos/numark-ns6-linux/daemon
 
 # The top-level build directory on which CMake was run.
-CMAKE_BINARY_DIR = "/home/joaobatista/Documentos/Numark NS6 Daemon/build"
+CMAKE_BINARY_DIR = /home/mauro/Documentos/numark-ns6-linux/daemon/build
 
 # Include any dependencies generated for this target.
 include CMakeFiles/ns6d.dir/depend.make
@@ -73,52 +73,67 @@ CMakeFiles/ns6d.dir/codegen:
 .PHONY : CMakeFiles/ns6d.dir/codegen
 
 CMakeFiles/ns6d.dir/src/main.c.o: CMakeFiles/ns6d.dir/flags.make
-CMakeFiles/ns6d.dir/src/main.c.o: /home/joaobatista/Documentos/Numark\ NS6\ Daemon/src/main.c
+CMakeFiles/ns6d.dir/src/main.c.o: /home/mauro/Documentos/numark-ns6-linux/daemon/src/main.c
 CMakeFiles/ns6d.dir/src/main.c.o: CMakeFiles/ns6d.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/home/joaobatista/Documentos/Numark NS6 Daemon/build/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_1) "Building C object CMakeFiles/ns6d.dir/src/main.c.o"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/ns6d.dir/src/main.c.o -MF CMakeFiles/ns6d.dir/src/main.c.o.d -o CMakeFiles/ns6d.dir/src/main.c.o -c "/home/joaobatista/Documentos/Numark NS6 Daemon/src/main.c"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/mauro/Documentos/numark-ns6-linux/daemon/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_1) "Building C object CMakeFiles/ns6d.dir/src/main.c.o"
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/ns6d.dir/src/main.c.o -MF CMakeFiles/ns6d.dir/src/main.c.o.d -o CMakeFiles/ns6d.dir/src/main.c.o -c /home/mauro/Documentos/numark-ns6-linux/daemon/src/main.c
 
 CMakeFiles/ns6d.dir/src/main.c.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/ns6d.dir/src/main.c.i"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E "/home/joaobatista/Documentos/Numark NS6 Daemon/src/main.c" > CMakeFiles/ns6d.dir/src/main.c.i
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/mauro/Documentos/numark-ns6-linux/daemon/src/main.c > CMakeFiles/ns6d.dir/src/main.c.i
 
 CMakeFiles/ns6d.dir/src/main.c.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/ns6d.dir/src/main.c.s"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S "/home/joaobatista/Documentos/Numark NS6 Daemon/src/main.c" -o CMakeFiles/ns6d.dir/src/main.c.s
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/mauro/Documentos/numark-ns6-linux/daemon/src/main.c -o CMakeFiles/ns6d.dir/src/main.c.s
 
 CMakeFiles/ns6d.dir/src/usb.c.o: CMakeFiles/ns6d.dir/flags.make
-CMakeFiles/ns6d.dir/src/usb.c.o: /home/joaobatista/Documentos/Numark\ NS6\ Daemon/src/usb.c
+CMakeFiles/ns6d.dir/src/usb.c.o: /home/mauro/Documentos/numark-ns6-linux/daemon/src/usb.c
 CMakeFiles/ns6d.dir/src/usb.c.o: CMakeFiles/ns6d.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/home/joaobatista/Documentos/Numark NS6 Daemon/build/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_2) "Building C object CMakeFiles/ns6d.dir/src/usb.c.o"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/ns6d.dir/src/usb.c.o -MF CMakeFiles/ns6d.dir/src/usb.c.o.d -o CMakeFiles/ns6d.dir/src/usb.c.o -c "/home/joaobatista/Documentos/Numark NS6 Daemon/src/usb.c"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/mauro/Documentos/numark-ns6-linux/daemon/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Building C object CMakeFiles/ns6d.dir/src/usb.c.o"
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/ns6d.dir/src/usb.c.o -MF CMakeFiles/ns6d.dir/src/usb.c.o.d -o CMakeFiles/ns6d.dir/src/usb.c.o -c /home/mauro/Documentos/numark-ns6-linux/daemon/src/usb.c
 
 CMakeFiles/ns6d.dir/src/usb.c.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/ns6d.dir/src/usb.c.i"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E "/home/joaobatista/Documentos/Numark NS6 Daemon/src/usb.c" > CMakeFiles/ns6d.dir/src/usb.c.i
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/mauro/Documentos/numark-ns6-linux/daemon/src/usb.c > CMakeFiles/ns6d.dir/src/usb.c.i
 
 CMakeFiles/ns6d.dir/src/usb.c.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/ns6d.dir/src/usb.c.s"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S "/home/joaobatista/Documentos/Numark NS6 Daemon/src/usb.c" -o CMakeFiles/ns6d.dir/src/usb.c.s
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/mauro/Documentos/numark-ns6-linux/daemon/src/usb.c -o CMakeFiles/ns6d.dir/src/usb.c.s
 
 CMakeFiles/ns6d.dir/src/protocol.c.o: CMakeFiles/ns6d.dir/flags.make
-CMakeFiles/ns6d.dir/src/protocol.c.o: /home/joaobatista/Documentos/Numark\ NS6\ Daemon/src/protocol.c
+CMakeFiles/ns6d.dir/src/protocol.c.o: /home/mauro/Documentos/numark-ns6-linux/daemon/src/protocol.c
 CMakeFiles/ns6d.dir/src/protocol.c.o: CMakeFiles/ns6d.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/home/joaobatista/Documentos/Numark NS6 Daemon/build/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_3) "Building C object CMakeFiles/ns6d.dir/src/protocol.c.o"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/ns6d.dir/src/protocol.c.o -MF CMakeFiles/ns6d.dir/src/protocol.c.o.d -o CMakeFiles/ns6d.dir/src/protocol.c.o -c "/home/joaobatista/Documentos/Numark NS6 Daemon/src/protocol.c"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/mauro/Documentos/numark-ns6-linux/daemon/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_3) "Building C object CMakeFiles/ns6d.dir/src/protocol.c.o"
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/ns6d.dir/src/protocol.c.o -MF CMakeFiles/ns6d.dir/src/protocol.c.o.d -o CMakeFiles/ns6d.dir/src/protocol.c.o -c /home/mauro/Documentos/numark-ns6-linux/daemon/src/protocol.c
 
 CMakeFiles/ns6d.dir/src/protocol.c.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/ns6d.dir/src/protocol.c.i"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E "/home/joaobatista/Documentos/Numark NS6 Daemon/src/protocol.c" > CMakeFiles/ns6d.dir/src/protocol.c.i
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/mauro/Documentos/numark-ns6-linux/daemon/src/protocol.c > CMakeFiles/ns6d.dir/src/protocol.c.i
 
 CMakeFiles/ns6d.dir/src/protocol.c.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/ns6d.dir/src/protocol.c.s"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S "/home/joaobatista/Documentos/Numark NS6 Daemon/src/protocol.c" -o CMakeFiles/ns6d.dir/src/protocol.c.s
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/mauro/Documentos/numark-ns6-linux/daemon/src/protocol.c -o CMakeFiles/ns6d.dir/src/protocol.c.s
+
+CMakeFiles/ns6d.dir/src/audio.c.o: CMakeFiles/ns6d.dir/flags.make
+CMakeFiles/ns6d.dir/src/audio.c.o: /home/mauro/Documentos/numark-ns6-linux/daemon/src/audio.c
+CMakeFiles/ns6d.dir/src/audio.c.o: CMakeFiles/ns6d.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/mauro/Documentos/numark-ns6-linux/daemon/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_4) "Building C object CMakeFiles/ns6d.dir/src/audio.c.o"
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/ns6d.dir/src/audio.c.o -MF CMakeFiles/ns6d.dir/src/audio.c.o.d -o CMakeFiles/ns6d.dir/src/audio.c.o -c /home/mauro/Documentos/numark-ns6-linux/daemon/src/audio.c
+
+CMakeFiles/ns6d.dir/src/audio.c.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/ns6d.dir/src/audio.c.i"
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/mauro/Documentos/numark-ns6-linux/daemon/src/audio.c > CMakeFiles/ns6d.dir/src/audio.c.i
+
+CMakeFiles/ns6d.dir/src/audio.c.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/ns6d.dir/src/audio.c.s"
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/mauro/Documentos/numark-ns6-linux/daemon/src/audio.c -o CMakeFiles/ns6d.dir/src/audio.c.s
 
 # Object files for target ns6d
 ns6d_OBJECTS = \
 "CMakeFiles/ns6d.dir/src/main.c.o" \
 "CMakeFiles/ns6d.dir/src/usb.c.o" \
-"CMakeFiles/ns6d.dir/src/protocol.c.o"
+"CMakeFiles/ns6d.dir/src/protocol.c.o" \
+"CMakeFiles/ns6d.dir/src/audio.c.o"
 
 # External object files for target ns6d
 ns6d_EXTERNAL_OBJECTS =
@@ -126,10 +141,11 @@ ns6d_EXTERNAL_OBJECTS =
 ns6d: CMakeFiles/ns6d.dir/src/main.c.o
 ns6d: CMakeFiles/ns6d.dir/src/usb.c.o
 ns6d: CMakeFiles/ns6d.dir/src/protocol.c.o
+ns6d: CMakeFiles/ns6d.dir/src/audio.c.o
 ns6d: CMakeFiles/ns6d.dir/build.make
 ns6d: CMakeFiles/ns6d.dir/compiler_depend.ts
 ns6d: CMakeFiles/ns6d.dir/link.txt
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir="/home/joaobatista/Documentos/Numark NS6 Daemon/build/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_4) "Linking C executable ns6d"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir=/home/mauro/Documentos/numark-ns6-linux/daemon/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_5) "Linking C executable ns6d"
 	$(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/ns6d.dir/link.txt --verbose=$(VERBOSE)
 
 # Rule to build all files generated by this target.
@@ -141,6 +157,6 @@ CMakeFiles/ns6d.dir/clean:
 .PHONY : CMakeFiles/ns6d.dir/clean
 
 CMakeFiles/ns6d.dir/depend:
-	cd "/home/joaobatista/Documentos/Numark NS6 Daemon/build" && $(CMAKE_COMMAND) -E cmake_depends "Unix Makefiles" "/home/joaobatista/Documentos/Numark NS6 Daemon" "/home/joaobatista/Documentos/Numark NS6 Daemon" "/home/joaobatista/Documentos/Numark NS6 Daemon/build" "/home/joaobatista/Documentos/Numark NS6 Daemon/build" "/home/joaobatista/Documentos/Numark NS6 Daemon/build/CMakeFiles/ns6d.dir/DependInfo.cmake" "--color=$(COLOR)"
+	cd /home/mauro/Documentos/numark-ns6-linux/daemon/build && $(CMAKE_COMMAND) -E cmake_depends "Unix Makefiles" /home/mauro/Documentos/numark-ns6-linux/daemon /home/mauro/Documentos/numark-ns6-linux/daemon /home/mauro/Documentos/numark-ns6-linux/daemon/build /home/mauro/Documentos/numark-ns6-linux/daemon/build /home/mauro/Documentos/numark-ns6-linux/daemon/build/CMakeFiles/ns6d.dir/DependInfo.cmake "--color=$(COLOR)"
 .PHONY : CMakeFiles/ns6d.dir/depend
 
