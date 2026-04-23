@@ -70,7 +70,7 @@ cd numark-ns6-linux/kmod-total
 make clean && make
 sudo make install
 sudo modprobe snd-ns6
-
+```
 Developed with ❤️ by:
 Mauro Junior (@maurojuniorr) & Gemini (IA)
 Husband, Father, Programmer, Professor, Researcher, and DJ.
