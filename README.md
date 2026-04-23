@@ -1,106 +1,76 @@
+# 🐧 Numark NS6 Native Linux Kernel Driver (`snd-ns6`)
+
+**Resurrecting a Legend: The first 99% functional native ALSA kernel driver for the Numark NS6.**
+
+This project is a low-level engineering effort to bring the **Numark NS6** (VID 15e4, PID 0079) to the Linux ecosystem. Unlike simple MIDI mappings, this is a **C-coded Kernel Module** that interfaces directly with the ALSA architecture, aiming for professional-grade stability and ultra-low latency.
+
+> [!IMPORTANT]
+> **CURRENT STATUS: ALPHA (v0.99) — "The Final Mile"**
+> The driver is fully operational for both MIDI and Audio. Current development is focused on fine-tuning the adaptive rate controller to eliminate the final 1% of audio micro-glitches (clicks) caused by hardware crystal drift.
 
 ---
 
-# 🐧 Numark NS6 Kernel Driver for Linux (kmod-snd-ns6)
-
-Este projeto apresenta um **driver de kernel nativo** para a controladora Numark NS6, escrito em C para o ecossistema ALSA. Diferente de mapeamentos simples, este módulo habilita a placa de som e a interface MIDI diretamente no núcleo do Linux, garantindo latência ultrabaixa e performance de nível profissional (Club Standard).
-
-> [!CAUTION]
-> **ESTADO ATUAL: ALFA (v0.98)**
-> O driver é funcional e estável para performance, mas ainda está em fase de testes intensivos. O uso em ambientes de produção real é por sua conta e risco. **Requer compilação de módulos de kernel.**
+## 👨‍🏫 About the Author
+**Mauro Junior**
+* **Computer Science Professor** at **IFAM** (Federal Institute of Amazonas, Brazil).
+* **Professional DJ** & Linux Enthusiast.
+* **Programmer** dedicated to hardware reverse engineering and kernel development.
 
 ---
 
-## 🔥 Diferenciais desta Implementação (Kernel Level)
+## 🔥 The Engineering Challenge (The "Final Boss")
 
-Por rodar diretamente no Kernel, este driver soluciona problemas históricos da NS6 no Linux:
+The NS6 was considered "Windows/Mac only" for 15 years due to its proprietary Ploytec chipset. This driver solves the core architectural hurdles that prevented official support:
 
-* **Anti-Drift Clock Sync:** Implementação de um *Fractional Frame Accumulator* que estabiliza o fluxo em 44100Hz, eliminando estalos (clicks) de sincronia USB.
-* **Dynamic Endpoint Discovery:** O driver escaneia e ativa automaticamente as sub-interfaces (*altsettings*) de áudio e MIDI, ignorando as limitações do driver genérico.
-* **Professional MIDI Queue:** Um "robô de fila" dedicado processa rajadas de comandos MIDI, garantindo que nenhum LED (como VU meters ou efeitos) seja perdido durante a performance.
-* **Zero-Freeze Protection:** Blindagem contra *Interrupt Storms* e travamentos de sistema via inicialização assíncrona (*Deferred Workqueue*).
+### 1. Anti-Drift Sync Engine
+The NS6 lacks a functional hardware feedback endpoint (EP 0x81 is a dummy returning constant `0xAAAAAA`). This causes a clock mismatch between the host and the hardware's internal crystal (~44101.5 Hz).
+* **The Solution:** We implemented a **Fractional Frame Accumulator** coupled with an **Adaptive PID Controller**.
+* The driver monitors the ALSA buffer fill level and dynamically adjusts the host consumption rate to converge with the hardware crystal.
 
----
+$$f_{adj} = K_p e(t) + K_i \int e(t) dt + K_d \frac{de(t)}{dt}$$
 
-## ✅ O que já está funcional (Alpha 0.98)
-
-### 🔊 Motor de Áudio (ALSA PCM)
-* **Playback & Capture:** 4 canais de saída e entrada em 24-bit (S24_3LE).
-* **Estabilidade:** Fluxo contínuo de pacotes isócronos que mantém o relógio da placa "quente", evitando distorções ao carregar faixas.
-* **Latência:** Resposta imediata ideal para Scratch e Beatmatch de precisão.
-
-### 🎹 Interface MIDI e LEDs
-* **Full Duplex MIDI:** Comunicação bidirecional estável entre Mixxx e NS6.
-* **Sincronização de Estado:** LEDs de botões, faders e seletores de FX sincronizam automaticamente ao abrir o software.
-* **Platters & Jogs:** Suporte total para a alta resolução (14-bit) dos discos.
-
-### 🛠️ Inicialização Inteligente
-* **Handshake Nativo:** O driver realiza o "aperto de mão" (Activate Vendor Mode) e o envio do SysEx de boot automaticamente ao plugar a controladora.
+### 2. 42-Byte MIDI Protocol
+Unlike standard USB-MIDI, the NS6 uses fixed 42-byte packets with `0xFD` padding. Our driver implements a native parser that ensures no LED commands or high-resolution (14-bit) Jog movements are lost during performance.
 
 ---
 
-## 🛠️ Requisitos de Compilação
+## ✅ Functional Features (Alpha 0.99)
 
-Você precisará dos headers do seu kernel atual. No Fedora:
+* **Pro Audio (ALSA PCM):** 4-channel output (Main + Headphones) at 24-bit (S24_3LE).
+* **Stable Isochronous Stream:** Packet management designed to keep the hardware clock "warm."
+* **Native Handshake:** Automated boot sequence (Activate Vendor Mode) and SysEx initialization handled at the kernel level.
+* **Endpoint Draining:** EP 0x86 (Waveform) is continuously drained to prevent USB bus stalls.
+
+---
+
+## 🏗️ Technical Heritage
+This driver is built upon the foundational logic of the **Ozzy Project** by **Marcel Bierling (Ploytec)**. We are honoring that legacy by extending the logic to support the specific quirks of the NS6 hardware, such as the unique initialization sequence and `bReq=0xE0` vendor requests.
+
+---
+
+## 🛠️ How to Help (Call for Developers)
+
+We are in the final stabilization phase. If you are an **ALSA developer**, a **USB timing expert**, or a **PID tuning wizard**, we need your help with:
+
+1.  **PID Calibration:** Fine-tuning the $K_p$, $K_i$, and $K_d$ parameters for smooth convergence across different CPU governors.
+2.  **The bReq=0xE0 Mystery:** Investigating xHCI limitations on Linux to replicate the proprietary Ploytec polling.
+3.  **Waveform Decoding:** Reverse engineering the EP 0x86 data protocol to enable the onboard LCD displays.
+
+---
+
+## 📥 Fast Installation
+
+### Prerequisites (Fedora example)
 ```bash
 sudo dnf install kernel-devel kernel-headers development-tools
-```
 
----
+Bash
+git clone [https://github.com/maurojuniorr/numark-ns6-linux.git](https://github.com/maurojuniorr/numark-ns6-linux.git)
+cd numark-ns6-linux/kmod-total
+make clean && make
+sudo make install
+sudo modprobe snd-ns6
 
-## 📥 Instalação e Teste
-
-1. **Clone o repositório e acesse o branch de desenvolvimento:**
-   ```bash
-   git clone https://github.com/seu-usuario/numark-ns6-linux.git
-   cd numark-ns6-linux
-   git checkout kmod-total
-   ```
-
-2. **Compile o módulo:**
-   ```bash
-   make clean
-   make
-   ```
-
-3. **Instale e carregue o driver:**
-   ```bash
-   sudo make install
-   sudo depmod -a
-   sudo modprobe snd-ns6
-   ```
-
-4. **Verifique se a placa foi reconhecida:**
-   ```bash
-   aplay -l | grep NS6
-   dmesg | grep NS6
-   ```
-
----
-
-## 🧪 Como ajudar nos testes (Modo Developer)
-
-Se você encontrar comportamentos estranhos nos LEDs ou no áudio, inicie o Mixxx via terminal para capturar os logs:
-```bash
-mixxx --debugLevel 2 --developer
-```
-Relate qualquer erro de `URB submitted while active` ou falhas de sincronia nas **Issues** deste repositório.
-
----
-
-## 🚧 Próximos Passos (Rumo ao Beta 1.0)
-* [ ] **Audio Warm-up:** Adicionar pré-carga de silêncio para eliminar o ruído residual nos primeiros 200ms da primeira música.
-* [ ] **Mapeamento Complementar:** Finalizar as funções de Shift no arquivo JS do Mixxx para aproveitar o novo motor MIDI.
-* [ ] **DKMS Support:** Implementar suporte a DKMS para que o driver não precise ser recompilado manualmente a cada atualização de kernel.
-
----
-
-## 🤝 Contribuições
-Este é um projeto comunitário. Se você entende de C, protocolos USB ou ALSA, sinta-se à vontade para enviar um Pull Request.
-
-**Desenvolvido com ❤️ por:**
-@maurojuniorr | @omaurodj e **Gemini (IA)**
-
-*Esposo, Pai, Programador, Professor, Pesquisador e DJ.*
-
----
+Developed with ❤️ by:
+Mauro Junior (@maurojuniorr) & Gemini (IA)
+Husband, Father, Programmer, Professor, Researcher, and DJ.
