@@ -34,9 +34,32 @@
 #define NS6_SAMPLE_BYTES    3
 #define NS6_FRAME_BYTES     (NS6_CHANNELS * NS6_SAMPLE_BYTES)  /* 12 */
 #define NS6_PKTS_PER_URB    32
-#define NS6_PKT_SIZE        66
-#define NS6_URB_BYTES       (NS6_PKTS_PER_URB * NS6_PKT_SIZE)  /* 2112 */
-#define NS6_FRAMES_PER_URB  (NS6_URB_BYTES / NS6_FRAME_BYTES)  /* 176 */
+/*
+ * Whole-frame isochronous packets.
+ *
+ * 44100 Hz over 8000 microframes is 5.5125 frames per microframe, so each packet
+ * carries 5 or 6 WHOLE frames (60 or 72 bytes) and a fractional accumulator spreads
+ * them so the long-run average is exactly 441/80 = 5.5125.
+ *
+ * This mirrors the vendor drivers: PGFramePatternObserver builds a frames-per-microframe
+ * pattern and PGIsocRB::initWrite_Std sets each packet length to
+ * bytesPerFrame * frames_in_that_packet. (ns6_usb.sys contains the constant 66 exactly
+ * once, so the Windows driver never sends a 66-byte packet.)
+ *
+ * The previous fixed 66-byte packet gave 8 * 66 = 528 bytes/ms = 44000 frames/s, i.e.
+ * 100 frames/s less than the device asks for on EP 0x81, which drained its 64-frame
+ * output FIFO every 0.64 s and was audible as a regular tick.
+ */
+#define NS6_FRAMES_NUM      441     /* 44100 / 100 */
+#define NS6_FRAMES_DEN      80      /*  8000 / 100  -> 5.5125 frames per microframe */
+#define NS6_MAX_FRAMES_PKT  6       /* worst case per packet, for buffer sizing */
+#define NS6_URB_BYTES       (NS6_PKTS_PER_URB * NS6_MAX_FRAMES_PKT * NS6_FRAME_BYTES)
+/*
+ * EP 0x81 (capture) has wMaxPacketSize 64, so it cannot carry a 72-byte whole-frame
+ * packet -- nor the previous 66-byte one, which already exceeded its maximum. Give the
+ * capture stream fixed 64-byte packets; its payload is discarded anyway.
+ */
+#define NS6_CAP_PKT_SIZE    64
 #define NS6_NURBS           2   /* ISO endpoint: max 2 concurrent URBs */
 
 struct ns6_stream {
@@ -46,6 +69,8 @@ struct ns6_stream {
     struct snd_pcm_substream *substream;
     spinlock_t                lock;
     unsigned int              hwptr;
+    unsigned int              frac;     /* fractional frame accumulator, 0..NS6_FRAMES_DEN-1 */
+    bool                      is_play;  /* whole-frame layout applies to playback only */
     bool                      running;
 };
 
@@ -78,6 +103,40 @@ static const struct snd_pcm_hardware ns6_hw = {
 /* ------------------------------------------------------------------ */
 /* Playback URB callback                                               */
 /* ------------------------------------------------------------------ */
+/*
+ * Lay out one URB so every packet holds a whole number of frames (5 or 6), with the
+ * long-run average exactly NS6_FRAMES_NUM/NS6_FRAMES_DEN. Sets the per-packet offsets
+ * and lengths plus the URB's total length, and returns the frame count for this URB.
+ */
+static unsigned int ns6_layout_urb(struct ns6_stream *s, struct urb *urb)
+{
+    unsigned int j, off = 0, total = 0;
+
+    if (!s->is_play) {                 /* capture: fixed packets within wMaxPacketSize */
+        for (j = 0; j < NS6_PKTS_PER_URB; j++) {
+            urb->iso_frame_desc[j].offset = j * NS6_CAP_PKT_SIZE;
+            urb->iso_frame_desc[j].length = NS6_CAP_PKT_SIZE;
+        }
+        urb->transfer_buffer_length = NS6_PKTS_PER_URB * NS6_CAP_PKT_SIZE;
+        return 0;
+    }
+
+    for (j = 0; j < NS6_PKTS_PER_URB; j++) {
+        unsigned int frames;
+
+        s->frac += NS6_FRAMES_NUM;
+        frames   = s->frac / NS6_FRAMES_DEN;
+        s->frac -= frames * NS6_FRAMES_DEN;
+
+        urb->iso_frame_desc[j].offset = off;
+        urb->iso_frame_desc[j].length = frames * NS6_FRAME_BYTES;
+        off   += frames * NS6_FRAME_BYTES;
+        total += frames;
+    }
+    urb->transfer_buffer_length = off;
+    return total;
+}
+
 static void ns6_play_urb_complete(struct urb *urb)
 {
     struct ns6_audio  *ns6 = urb->context;
@@ -98,6 +157,7 @@ static void ns6_play_urb_complete(struct urb *urb)
     if (!s->running || !sub || !snd_pcm_running(sub) ||
         !sub->runtime->dma_area) {
         memset(urb->transfer_buffer, 0, NS6_URB_BYTES);
+        ns6_layout_urb(s, urb);
         spin_unlock_irqrestore(&s->lock, flags);
         goto resubmit;
     }
@@ -105,7 +165,7 @@ static void ns6_play_urb_complete(struct urb *urb)
     {
         unsigned int buf_frames = sub->runtime->buffer_size;
         unsigned char *dma = sub->runtime->dma_area;
-        unsigned int frames = NS6_FRAMES_PER_URB;
+        unsigned int frames = ns6_layout_urb(s, urb);
 
         if (s->hwptr + frames > buf_frames) {
             unsigned int chunk1 = buf_frames - s->hwptr;
@@ -149,7 +209,7 @@ static void ns6_cap_urb_complete(struct urb *urb)
 static int ns6_alloc_urbs(struct ns6_audio *ns6, struct ns6_stream *s,
                            u8 ep, usb_complete_t complete)
 {
-    int i, j;
+    int i;
     unsigned int pipe = (ep & USB_DIR_IN) ?
         usb_rcvisocpipe(ns6->udev, ep & 0x7f) :
         usb_sndisocpipe(ns6->udev, ep & 0x7f);
@@ -174,10 +234,9 @@ static int ns6_alloc_urbs(struct ns6_audio *ns6, struct ns6_stream *s,
         s->urbs[i]->interval               = 1;
         s->urbs[i]->transfer_flags         = URB_ISO_ASAP;
 
-        for (j = 0; j < NS6_PKTS_PER_URB; j++) {
-            s->urbs[i]->iso_frame_desc[j].offset = j * NS6_PKT_SIZE;
-            s->urbs[i]->iso_frame_desc[j].length = NS6_PKT_SIZE;
-        }
+        s->frac    = 0;
+        s->is_play = !(ep & USB_DIR_IN);
+        ns6_layout_urb(s, s->urbs[i]);
     }
     return 0;
 }
