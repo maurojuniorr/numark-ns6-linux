@@ -1,0 +1,6 @@
+#!/bin/zsh
+set -eu
+
+# The HAL plug-in is discovered by coreaudiod. Restarting this service makes
+# the newly installed bundle available immediately without a system reboot.
+/usr/bin/killall coreaudiod >/dev/null 2>&1 || true
