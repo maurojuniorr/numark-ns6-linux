@@ -1,93 +1,86 @@
 # ns6d — Numark NS6 Userspace Driver
 
-Driver userspace para a Numark NS6 no Linux.
-Expõe a controladora como porta ALSA MIDI virtual para uso com Mixxx.
+Driver userspace para a Numark NS6 no Linux. O daemon recebe e envia o MIDI
+USB pela ALSA Sequencer e publica áudio como dois nós PipeWire próprios:
+**Numark USB Audio Device** (4 canais) e **Numark USB Audio Device Input** (2 canais). O áudio
+passa diretamente pelas filas do daemon; `snd-aloop` não é usado.
 
-## Protocolo
+## Fluxos de áudio e MIDI
 
-- **Controle:** MIDI packed em Bulk USB (EP 0x83/0x04), 42 bytes/pacote
-- **Áudio:** PCM 24-bit 4 canais 44100Hz via ISO USB (EP 0x02/0x81)
-- **Waveform:** stream 1-bit 2.5MB/s via EP 0x86
-- **4 decks** via canais MIDI 1-4, layer gerenciado pela controladora
+- **Saída:** PipeWire entrega PCM intercalado S24_3LE, 44,1 kHz, em quatro
+  canais. Os canais 1–2 vão ao Main e 3–4 aos fones. O PipeWire converte o
+  formato/taxa dos aplicativos para o formato fixo da NS6 no grafo compartilhado.
+- **Entrada:** o endpoint USB `0x86` transporta áudio estéreo empacotado. O
+  daemon decodifica os blocos de 64 bytes, converte para S24_3LE e publica uma
+  source estéreo a 44,1 kHz. Aplicativos PipeWire podem compartilhar essa source.
+- **Relógio USB:** o endpoint isócrono `0x81` fornece feedback de 42–46
+  frames/ms. O controlador ajusta a cadência de saída; sem feedback válido por
+  2 s, usa o ritmo nominal de 44,1 kHz.
+- **Buffers:** filas SPSC isolam as callbacks USB e PipeWire de I/O bloqueante.
+  A correção fracionária limitada acompanha a ocupação da fila de saída para
+  compensar a deriva entre o relógio do host e o da NS6.
+- **MIDI:** mensagens packed de 42 bytes nos endpoints Bulk `0x83`/`0x04`,
+  expostas como cliente ALSA Sequencer **Numark NS6 MIDI Bridge**.
 
 ## Dependências
 
 ### Fedora
+
 ```bash
-sudo dnf install libusb1-devel alsa-lib-devel cmake gcc pkg-config
+sudo dnf install libusb1-devel alsa-lib-devel pipewire-devel cmake gcc pkg-config
 ```
 
 ### Debian/Ubuntu
+
 ```bash
-sudo apt install libusb-1.0-0-dev libasound2-dev cmake gcc pkg-config
+sudo apt install libusb-1.0-0-dev libasound2-dev libpipewire-0.3-dev cmake gcc pkg-config
 ```
 
-## Build
+## Build e instalação
 
 ```bash
-git clone <repo>
-cd ns6d
 cmake -B build
 cmake --build build
-```
-
-## Instalação
-
-```bash
-# udev rules (acesso sem root)
-sudo cp udev/99-ns6.rules /etc/udev/rules.d/
-sudo udevadm control --reload
-sudo udevadm trigger
-
-# Binário
 sudo cmake --install build
+sudo udevadm control --reload-rules
+sudo udevadm trigger
 ```
 
-## Uso
+A instalação remove o serviço systemd antigo e os aliases ALSA do loopback
+instalados por versões anteriores. Ela tenta descarregar `snd-aloop` se nenhum
+outro processo o estiver usando. O serviço atual é um serviço **do usuário**;
+ative-o na sessão gráfica que executa PipeWire:
 
 ```bash
-# Conecta a NS6 via USB e roda o daemon
-ns6d
+systemctl --user daemon-reload
+systemctl --user enable --now ns6d
 ```
 
-O daemon cria uma porta ALSA MIDI chamada **"Numark NS6"**.
-No Mixxx: `Preferences → Controllers → Numark NS6 MIDI`
+As regras udev dão acesso à NS6 e ao ALSA Sequencer ao usuário da sessão ativa.
+Se o dispositivo já estava conectado durante a instalação, desconecte e conecte
+novamente o USB para aplicar a ACL. O daemon mantém o transporte USB ativo e
+reinicia após uma desconexão para recuperar a controladora.
 
-Para conectar manualmente via aconnect:
+No Mixxx, selecione **Numark USB Audio Device** e associe os canais 1–2 ao Main e
+3–4 aos fones. Para entrada, selecione **Numark USB Audio Device Input**. O áudio do sistema
+também pode usar a saída PipeWire da NS6.
+
+Confira os nós com `wpctl status`; MIDI com `aconnect -l` e logs com:
+
 ```bash
-aconnect -l                    # lista portas
-aconnect "Numark NS6" mixxx    # conecta ao Mixxx
+journalctl --user -u ns6d -f
 ```
 
-## Estrutura
+## Estado
 
-```
-src/
-  ns6.h        → constantes do protocolo e structs
-  protocol.c   → init sequence + parse de pacotes MIDI
-  usb.c        → libusb: transfers bulk e ISO
-  main.c       → ALSA virtual MIDI port + loop principal
-udev/
-  99-ns6.rules → permissões USB
-```
+- [x] Identificação USB e sequência de inicialização da NS6
+- [x] MIDI packed ↔ ALSA Sequencer, quatro decks e jog 14-bit
+- [x] Nó PipeWire de saída com 4 canais e source de entrada estéreo
+- [x] Feedback do clock USB e correção fracionária da fila de saída
+- [x] Recuperação do daemon após perda do transporte USB
+- [ ] Validar em hardware a reprodução simultânea, a captura e a latência no grafo PipeWire
+- [ ] Validar estabilidade prolongada e contadores de underrun/drop no hardware real
 
-## Status
-
-- [x] Identificação do protocolo (engenharia reversa)
-- [x] Sequência de init (14 passos)
-- [x] Parse MIDI packed → MIDI padrão
-- [x] 4 decks + layer system
-- [x] CC 14-bit (faders, EQs, jog position)
-- [x] Jog wheel (touch + no-touch modes)
-- [x] ALSA virtual MIDI port
-- [ ] ALSA PCM (áudio 24-bit 4ch) — próxima fase
-- [ ] Waveform display pipe — próxima fase
-- [ ] Kernel module (Fase 2)
-
-## Fase 2 — Kernel Module
-
-Depois de validar o daemon userspace, o mesmo protocolo
-será portado para um kernel module (`snd-usb-ns6.ko`) com:
-- Latência de áudio profissional
-- Aparece como dispositivo nativo no ALSA
-- DKMS para sobreviver updates do kernel
+O caminho Linux é um daemon userspace, não um módulo de kernel. A validação de
+áudio simultâneo e da latência real depende do hardware e da sessão PipeWire
+usados.

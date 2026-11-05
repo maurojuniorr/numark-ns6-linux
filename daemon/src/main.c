@@ -19,6 +19,7 @@ typedef struct {
 static ns6_midi_t    g_midi = {0};
 static ns6_device_t *g_dev  = NULL;
 static volatile bool g_quit = false;
+static volatile sig_atomic_t g_usb_failed = 0;
 
 static int midi_open(ns6_midi_t *m)
 {
@@ -28,22 +29,22 @@ static int midi_open(ns6_midi_t *m)
         return r;
     }
 
-    snd_seq_set_client_name(m->seq, "Numark NS6");
+    snd_seq_set_client_name(m->seq, "Numark NS6 MIDI Bridge");
     m->client = snd_seq_client_id(m->seq);
 
     /* Buffer grande pra aguentar burst de LEDs do Mixxx */
-    snd_seq_set_input_buffer_size(m->seq, 65536);
+    snd_seq_set_input_buffer_size(m->seq, 262144);
     snd_seq_set_output_buffer_size(m->seq, 65536);
 
     snd_seq_client_pool_t *pool;
     snd_seq_client_pool_alloca(&pool);
     snd_seq_get_client_pool(m->seq, pool);
-    snd_seq_client_pool_set_input_pool(pool, 2048);
+    snd_seq_client_pool_set_input_pool(pool, 16384);
     snd_seq_client_pool_set_output_pool(pool, 2048);
     snd_seq_set_client_pool(m->seq, pool);
 
     m->port = snd_seq_create_simple_port(
-        m->seq, "NS6 MIDI",
+        m->seq, "Numark USB Audio Device MIDI",
         SND_SEQ_PORT_CAP_READ  | SND_SEQ_PORT_CAP_WRITE |
         SND_SEQ_PORT_CAP_SUBS_READ | SND_SEQ_PORT_CAP_SUBS_WRITE,
         SND_SEQ_PORT_TYPE_MIDI_GENERIC | SND_SEQ_PORT_TYPE_HARDWARE);
@@ -120,8 +121,7 @@ static void *midi_out_thread(void *arg)
             continue;
         }
         if (r == -ENOSPC) {
-            snd_seq_drop_input(g_midi.seq);
-            fprintf(stderr, "ns6d: LED pool overflow — dropped\n");
+            fprintf(stderr, "ns6d: ALSA MIDI input FIFO overran; events were lost\n");
             continue;
         }
         if (r < 0) {
@@ -159,10 +159,8 @@ static void *midi_out_thread(void *arg)
                 memset(pkt, NS6_IDLE_BYTE, NS6_CTRL_PKT_SIZE);
                 memcpy(pkt, syx, len);
                 pkt[NS6_CTRL_PKT_SIZE - 1] = NS6_PKT_TERMINATOR;
-                int transferred = 0;
-                libusb_bulk_transfer(dev->usb, NS6_EP_CTRL_OUT,
-                                     pkt, NS6_CTRL_PKT_SIZE,
-                                     &transferred, 200);
+                if (ns6_send_ctrl_packet(dev, pkt) < 0)
+                    fprintf(stderr, "ns6d: could not queue SysEx for USB output\n");
                 printf("ns6d: SysEx → hardware (%d bytes)\n", len);
             }
             snd_seq_free_event(ev);
@@ -184,7 +182,8 @@ static void *midi_out_thread(void *arg)
 static void *usb_thread(void *arg)
 {
     ns6_device_t *dev = (ns6_device_t *)arg;
-    ns6_run(dev);
+    if (ns6_run(dev) < 0 && !g_quit)
+        g_usb_failed = 1;
     return NULL;
 }
 
@@ -213,8 +212,7 @@ int main(int argc, char **argv)
             ns6_debug_raw = 1;
     }
 
-    printf("ns6d — Numark NS6 MIDI daemon\n");
-    printf("Audio handled by snd-usb-audio kernel module\n");
+    printf("ns6d — Numark NS6 ALSA MIDI/PipeWire audio daemon\n");
     if (ns6_debug_raw)
         printf("DEBUG: raw packet mode ON\n");
     printf("\n");
@@ -235,7 +233,6 @@ int main(int argc, char **argv)
     }
 
     g_dev->on_midi_in = on_midi_in;
-    g_dev->no_audio   = true;   /* áudio sempre com snd-usb-audio */
 
     if (ns6_init(g_dev) < 0) {
         fprintf(stderr, "ns6d: init failed\n");
@@ -245,6 +242,8 @@ int main(int argc, char **argv)
     }
 
     g_dev->running = true;   /* antes de criar threads */
+    if (ns6_audio_start(g_dev) < 0)
+        fprintf(stderr, "ns6d: PipeWire audio unavailable; MIDI stays active and USB output is silent\n");
 
     pthread_t usb_thr, led_thr, midi_out_thr;
     pthread_create(&usb_thr,      NULL, usb_thread,         g_dev);
@@ -252,9 +251,14 @@ int main(int argc, char **argv)
     pthread_create(&led_thr,      NULL, midi_out_thread,     g_dev);
 
     printf("ns6d: running. Press Ctrl+C to stop.\n");
-    while (!g_quit)
+    while (!g_quit && !g_usb_failed)
         sleep(1);
 
+    if (g_usb_failed) {
+        fprintf(stderr, "ns6d: USB transport stopped; exiting for service restart\n");
+        /* Let systemd replace libusb's stale transfers and release ALSA state. */
+        return 1;
+    }
     g_dev->running = false;
     libusb_interrupt_event_handler(g_dev->ctx);
     ns6_midi_out_wake();
@@ -262,6 +266,7 @@ int main(int argc, char **argv)
     pthread_join(midi_out_thr, NULL);
     pthread_join(led_thr,      NULL);
 
+    ns6_audio_stop(g_dev);
     ns6_close(g_dev);
     midi_close(&g_midi);
     printf("ns6d: bye\n");

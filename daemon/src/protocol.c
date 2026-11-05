@@ -78,6 +78,21 @@ static int ns6_vendor_mode_get(libusb_device_handle *usb)
     return 0;
 }
 
+static int ns6_set_sample_rate(libusb_device_handle *usb, uint8_t endpoint)
+{
+    uint8_t rate[3] = NS6_SAMPLE_RATE_44100;
+    int r = ctrl_out(usb, 0x22, NS6_BREQ_SET_SAMPLE_RATE, 0x0100,
+                     endpoint, rate, sizeof(rate));
+    if (r < 0) return r;
+    if (r != (int)sizeof(rate)) {
+        fprintf(stderr, "ns6: short sample-rate write to endpoint 0x%02x\n",
+                endpoint);
+        return LIBUSB_ERROR_IO;
+    }
+    printf("ns6: endpoint 0x%02x sample rate set to 44100 Hz\n", endpoint);
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* ------------------------------------------------------------------ */
 /* Passo 12 — Ativar modo operacional                                   */
@@ -229,7 +244,7 @@ int ns6_init(ns6_device_t *dev)
 
     /* Passo 1 — SET_CONFIGURATION 1
      * Se o kernel module de áudio estiver ativo, pula — ele já configurou */
-    /* Passo 1 — Claim interface 0 apenas (interface 1 com snd-usb-audio) */
+    /* Interface 0 also owns the isochronous playback endpoint. */
     r = libusb_claim_interface(usb, 0);
     if (r < 0) {
         fprintf(stderr, "ns6: claim interface 0: %s\n", libusb_strerror(r));
@@ -248,20 +263,28 @@ int ns6_init(ns6_device_t *dev)
     }
     printf("ns6: interface 0 alt=1 OK\n");
 
-    /* Interface 1 precisa de alt=1 para o MIDI funcionar.
-     * Claimamos temporariamente só para setar, depois liberamos
-     * para o snd-usb-audio/snd-ns6-audio usar. */
+    /* Select interface 1's feedback and record-mix endpoints. */
     r = libusb_claim_interface(usb, 1);
     if (r == 0) {
-        libusb_set_interface_alt_setting(usb, 1, 1);
-        libusb_release_interface(usb, 1);
-        printf("ns6: interface 1 alt=1 OK (released)\n");
+        r = libusb_set_interface_alt_setting(usb, 1, 1);
+        if (r < 0) {
+            fprintf(stderr, "ns6: set_interface 1,1: %s\n", libusb_strerror(r));
+            return r;
+        }
+        printf("ns6: interface 1 alt=1 claimed\n");
     } else {
-        printf("ns6: interface 1 already claimed by kernel driver (OK)\n");
+        fprintf(stderr, "ns6: claim interface 1: %s\n", libusb_strerror(r));
+        return r;
     }
 
-    /* Passo 4 — CLEAR_FEATURE nos endpoints MIDI */
-    libusb_clear_halt(usb, NS6_EP_WAVEFORM);
+    /* Set both USB audio clocks before starting the isochronous stream. */
+    r = ns6_set_sample_rate(usb, 0x02);
+    if (r < 0) return r;
+    r = ns6_set_sample_rate(usb, NS6_EP_CAPTURE);
+    if (r < 0) return r;
+
+    /* Passo 4 — clear stalls on the active endpoints. */
+    libusb_clear_halt(usb, NS6_EP_CAPTURE);
     libusb_clear_halt(usb, NS6_EP_CTRL_OUT);
     libusb_clear_halt(usb, NS6_EP_CTRL_IN);
     printf("ns6: endpoints cleared\n");
@@ -269,8 +292,6 @@ int ns6_init(ns6_device_t *dev)
     /* Passo 5 — Vendor mode query */
     r = ns6_vendor_mode_get(usb);
     if (r < 0) return r;
-
-    printf("ns6: sample rate config skipped (snd-usb-audio)\n");
 
     /* Passo 6 — Vendor mode query (confirmação) */
     r = ns6_vendor_mode_get(usb);
@@ -348,6 +369,13 @@ void ns6_parse_packet(ns6_device_t *dev, const uint8_t *pkt)
         uint8_t ch  = status & 0x0F;
         int     dk  = ch - 1;   /* deck index 0..3 */
 
+        /* 0xfd is packet padding, not a valid MIDI data byte. */
+        if (note >= 0x80 ||
+            ((msg == 0x90 || msg == 0xB0) && value >= 0x80)) {
+            i += 3;
+            continue;
+        }
+
         switch (msg) {
 
         /* ---- Note On ---- */
@@ -378,6 +406,8 @@ void ns6_parse_packet(ns6_device_t *dev, const uint8_t *pkt)
 
         /* ---- Note Off ---- */
         case 0x80:
+            if (value >= 0x80)
+                value = 0;
             if (dk >= 0 && dk < 4) {
                 if (note == NS6_NOTE_PLAY)
                     st->play[dk] = false;
