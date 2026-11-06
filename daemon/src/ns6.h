@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdatomic.h>
 #include <libusb-1.0/libusb.h>
 
 /* ------------------------------------------------------------------ */
@@ -147,6 +148,7 @@ typedef struct ns6_device ns6_device_t;
 struct ns6_device {
     libusb_device_handle *usb;
     libusb_context       *ctx;
+    char                  firmware_version[32];
     ns6_state_t           state;
 
     void (*on_midi_in)(ns6_device_t *dev,
@@ -154,9 +156,20 @@ struct ns6_device {
 
     bool  running;
     bool  transport_lost;
+    atomic_bool clock_feedback_locked;
     void *priv;
     void *audio_priv;
 };
+
+typedef struct {
+    bool output_active;
+    bool input_active;
+    size_t output_queued_frames;
+    uint64_t output_overruns;
+    uint64_t output_underruns;
+    uint64_t input_drops;
+    uint64_t input_underruns;
+} ns6_audio_status_t;
 
 /* ------------------------------------------------------------------ */
 /* API pública                                                          */
@@ -179,6 +192,7 @@ int ns6_audio_start(ns6_device_t *dev);
 void ns6_audio_stop(ns6_device_t *dev);
 void ns6_audio_reset(ns6_device_t *dev);
 size_t ns6_audio_output_queued(ns6_device_t *dev);
+void ns6_audio_get_status(ns6_device_t *dev, ns6_audio_status_t *status);
 bool ns6_audio_capture_requested(ns6_device_t *dev);
 void ns6_audio_output_read(ns6_device_t *dev, uint8_t *frames, size_t count,
                            double source_frames_per_output_frame);

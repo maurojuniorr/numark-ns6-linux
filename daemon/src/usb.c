@@ -87,9 +87,14 @@ static void LIBUSB_CALL feedback_in_cb(struct libusb_transfer *xfer) {
             const uint8_t *data = xfer->buffer +
                     (size_t)i * priv->feedback_packet_bytes;
             if (ns6_clock_control_observe(&priv->clock,
-                    data[0], now_ms) && !was_locked)
-                fprintf(stderr, "ns6: USB clock feedback locked at %u frames/ms\n",
-                        data[0]);
+                    data[0], now_ms)) {
+                atomic_store_explicit(&dev->clock_feedback_locked, true,
+                                      memory_order_release);
+                if (!was_locked)
+                    fprintf(stderr,
+                            "ns6: USB clock feedback locked at %u frames/ms\n",
+                            data[0]);
+            }
         }
     }
     int r = libusb_submit_transfer(xfer);
@@ -247,8 +252,11 @@ static void LIBUSB_CALL audio_out_cb(struct libusb_transfer *xfer)
     if (!slot->dev->running) return;
     ns6_usb_priv_t *priv = slot->dev->priv;
     uint64_t now_ms = monotonic_ms();
-    if (priv->clock.locked && now_ms - priv->clock.last_feedback_ms > 2000)
+    if (priv->clock.locked && now_ms - priv->clock.last_feedback_ms > 2000) {
         ns6_clock_control_reset(&priv->clock);
+        atomic_store_explicit(&slot->dev->clock_feedback_locked, false,
+                              memory_order_release);
+    }
 
     size_t bytes = 0;
     memset(xfer->buffer, 0,
@@ -528,6 +536,7 @@ ns6_device_t *ns6_open(void)
 {
     ns6_device_t *dev = calloc(1, sizeof(ns6_device_t));
     if (!dev) return NULL;
+    atomic_init(&dev->clock_feedback_locked, false);
 
     int r = libusb_init(&dev->ctx);
     if (r < 0) {
@@ -633,6 +642,8 @@ int ns6_reopen(ns6_device_t *dev)
     close_usb_transport(dev);
     memset(&dev->state, 0, sizeof(dev->state));
     dev->transport_lost = false;
+    atomic_store_explicit(&dev->clock_feedback_locked, false,
+                          memory_order_release);
     int r = libusb_init(&dev->ctx);
     if (r < 0) {
         fprintf(stderr, "ns6: libusb_init during reconnect: %s\n", libusb_strerror(r));

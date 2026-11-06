@@ -37,6 +37,7 @@ struct ns6_audio {
     atomic_uint_fast64_t output_underruns;
     atomic_uint_fast64_t input_drops;
     atomic_uint_fast64_t input_underruns;
+    atomic_bool output_active;
     atomic_bool input_active;
     atomic_bool input_reprime;
     ns6_audio_ring_t output_ring;
@@ -53,8 +54,11 @@ static void stream_state_changed(void *userdata, enum pw_stream_state old_state,
                                  enum pw_stream_state state, const char *error) {
     (void)old_state;
     ns6_pw_stream_t *endpoint = userdata;
+    bool active = state == PW_STREAM_STATE_STREAMING;
+    if (endpoint == &endpoint->audio->output)
+        atomic_store_explicit(&endpoint->audio->output_active, active,
+                              memory_order_release);
     if (endpoint == &endpoint->audio->input) {
-        bool active = state == PW_STREAM_STATE_STREAMING;
         atomic_store_explicit(&endpoint->audio->input_active, active,
                               memory_order_release);
         if (active)
@@ -154,6 +158,7 @@ static struct pw_stream *create_stream(ns6_audio_t *audio,
         const enum spa_audio_channel *positions,
         const struct pw_stream_events *events) {
     char channel_count[4];
+    bool is_output = strcmp(media_class, "Audio/Sink") == 0;
     snprintf(channel_count, sizeof(channel_count), "%u", channels);
     struct pw_properties *props = pw_properties_new(
             PW_KEY_MEDIA_TYPE, "Audio",
@@ -162,6 +167,16 @@ static struct pw_stream *create_stream(ns6_audio_t *audio,
             PW_KEY_MEDIA_CLASS, media_class,
             PW_KEY_NODE_NAME, name,
             PW_KEY_NODE_DESCRIPTION, description,
+            PW_KEY_DEVICE_DESCRIPTION, description,
+            PW_KEY_DEVICE_NICK, "Numark NS6",
+            PW_KEY_DEVICE_ICON_NAME, is_output ? "audio-speakers" :
+                    "audio-input-microphone-symbolic",
+            PW_KEY_DEVICE_FORM_FACTOR, is_output ? "speaker" : "microphone",
+            PW_KEY_DEVICE_BUS, "usb",
+            PW_KEY_DEVICE_VENDOR_NAME, "Numark",
+            PW_KEY_DEVICE_VENDOR_ID, "0x15e4",
+            PW_KEY_DEVICE_PRODUCT_NAME, "Numark NS6",
+            PW_KEY_DEVICE_PRODUCT_ID, "0x0079",
             PW_KEY_AUDIO_CHANNELS, channel_count,
             PW_KEY_AUDIO_RATE, "44100",
             PW_KEY_NODE_ALWAYS_PROCESS, always_process ? "true" : "false",
@@ -233,6 +248,7 @@ int ns6_audio_start(ns6_device_t *dev) {
     atomic_init(&audio->output_underruns, 0);
     atomic_init(&audio->input_drops, 0);
     atomic_init(&audio->input_underruns, 0);
+    atomic_init(&audio->output_active, false);
     atomic_init(&audio->input_active, false);
     atomic_init(&audio->input_reprime, false);
 
@@ -284,6 +300,26 @@ size_t ns6_audio_output_queued(ns6_device_t *dev) {
     size_t write = atomic_load_explicit(&audio->output_ring.write_index,
                                         memory_order_acquire);
     return write - read;
+}
+
+void ns6_audio_get_status(ns6_device_t *dev, ns6_audio_status_t *status) {
+    if (!status) return;
+    memset(status, 0, sizeof(*status));
+    ns6_audio_t *audio = dev ? dev->audio_priv : NULL;
+    if (!audio) return;
+    status->output_active = atomic_load_explicit(&audio->output_active,
+                                                  memory_order_acquire);
+    status->input_active = atomic_load_explicit(&audio->input_active,
+                                                 memory_order_acquire);
+    status->output_queued_frames = ns6_audio_output_queued(dev);
+    status->output_overruns = atomic_load_explicit(&audio->output_overruns,
+                                                    memory_order_relaxed);
+    status->output_underruns = atomic_load_explicit(&audio->output_underruns,
+                                                     memory_order_relaxed);
+    status->input_drops = atomic_load_explicit(&audio->input_drops,
+                                               memory_order_relaxed);
+    status->input_underruns = atomic_load_explicit(&audio->input_underruns,
+                                                   memory_order_relaxed);
 }
 
 void ns6_audio_reset(ns6_device_t *dev) {

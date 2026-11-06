@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Numark NS6 Status
+Comment=View Numark NS6 audio driver status
+Exec=ns6-status
+Icon=audio-speakers
+Terminal=false
+Categories=AudioVideo;Audio;
+StartupNotify=true

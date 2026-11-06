@@ -3,6 +3,9 @@
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
+#include <time.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <alsa/asoundlib.h>
@@ -27,18 +30,121 @@ typedef struct {
     atomic_uint input_read;
     atomic_uint input_write;
     atomic_uint input_dropped;
+    atomic_uint_fast64_t input_dropped_total;
+    atomic_uint_fast64_t seq_input_overruns;
 } ns6_midi_t;
 
 static ns6_midi_t    g_midi = {0};
 static ns6_device_t *g_dev  = NULL;
 static volatile bool g_quit = false;
 static volatile sig_atomic_t g_usb_failed = 0;
+static uint64_t g_reconnects = 0;
+static uint64_t g_started_ms = 0;
+
+static uint64_t monotonic_ms(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
+}
+
+static bool status_path(char *path, size_t size)
+{
+    const char *runtime = getenv("XDG_RUNTIME_DIR");
+    char fallback[64];
+    if (!runtime || !*runtime) {
+        snprintf(fallback, sizeof(fallback), "/run/user/%u", (unsigned)getuid());
+        runtime = fallback;
+    }
+    int length = snprintf(path, size, "%s/ns6d.status", runtime);
+    return length >= 0 && (size_t)length < size;
+}
+
+static void write_status(void)
+{
+    char path[512], temporary[544];
+    if (!status_path(path, sizeof(path)) ||
+        snprintf(temporary, sizeof(temporary), "%s.tmp", path) < 0 ||
+        strlen(path) + sizeof(".tmp") > sizeof(temporary))
+        return;
+    FILE *file = fopen(temporary, "w");
+    if (!file) return;
+    ns6_audio_status_t audio;
+    ns6_audio_get_status(g_dev, &audio);
+    const char *usb = g_quit ? "stopping" :
+            (g_usb_failed || !g_dev || !g_dev->usb ?
+             "reconnecting" : "connected");
+    fprintf(file,
+            "Numark NS6 driver status\n"
+            "USB: %s\n"
+            "Firmware Version: %s\n"
+            "ALSA MIDI: client %d, port %d\n"
+            "PipeWire output: %s\n"
+            "PipeWire input: %s\n"
+            "USB clock feedback: %s\n"
+            "Output queue: %zu frames (%.1f ms at 44.1 kHz)\n"
+            "Audio output underruns: %llu frames\n"
+            "Audio output overruns: %llu frames\n"
+            "Audio input drops: %llu frames\n"
+            "Audio input underruns: %llu frames\n"
+            "MIDI input queue drops: %llu\n"
+            "ALSA MIDI input FIFO overruns: %llu\n"
+            "USB reconnects: %llu\n"
+            "Uptime: %llu seconds\n",
+            usb,
+            g_dev && g_dev->firmware_version[0] ?
+                    g_dev->firmware_version : "Unavailable",
+            g_midi.client, g_midi.port,
+            g_dev && g_dev->audio_priv ?
+                    (audio.output_active ? "active" : "idle") : "unavailable",
+            g_dev && g_dev->audio_priv ?
+                    (audio.input_active ? "active" : "idle") : "unavailable",
+            g_dev && atomic_load_explicit(&g_dev->clock_feedback_locked,
+                                           memory_order_acquire) ? "locked" : "fallback",
+            audio.output_queued_frames,
+            audio.output_queued_frames * 1000.0 / 44100.0,
+            (unsigned long long)audio.output_underruns,
+            (unsigned long long)audio.output_overruns,
+            (unsigned long long)audio.input_drops,
+            (unsigned long long)audio.input_underruns,
+            (unsigned long long)atomic_load_explicit(&g_midi.input_dropped_total,
+                                                      memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&g_midi.seq_input_overruns,
+                                                      memory_order_relaxed),
+            (unsigned long long)g_reconnects,
+            (unsigned long long)((monotonic_ms() - g_started_ms) / 1000));
+    if (fclose(file) != 0 || rename(temporary, path) < 0)
+        unlink(temporary);
+}
+
+static int show_status(void)
+{
+    char path[512];
+    struct stat info;
+    if (!status_path(path, sizeof(path)) || stat(path, &info) < 0 ||
+        time(NULL) - info.st_mtime > 4) {
+        puts("ns6d is not running (or its status snapshot is stale)");
+        return 1;
+    }
+    FILE *file = fopen(path, "r");
+    if (!file) {
+        perror("ns6d: open status");
+        return 1;
+    }
+    char line[256];
+    while (fgets(line, sizeof(line), file))
+        fputs(line, stdout);
+    fclose(file);
+    return 0;
+}
 
 static int midi_open(ns6_midi_t *m)
 {
     atomic_init(&m->input_read, 0);
     atomic_init(&m->input_write, 0);
     atomic_init(&m->input_dropped, 0);
+    atomic_init(&m->input_dropped_total, 0);
+    atomic_init(&m->seq_input_overruns, 0);
 
     int r = snd_seq_open(&m->seq, "default", SND_SEQ_OPEN_DUPLEX, 0);
     if (r < 0) {
@@ -86,6 +192,7 @@ static void midi_queue_input(ns6_midi_t *m,
     unsigned read = atomic_load_explicit(&m->input_read, memory_order_acquire);
     if (write - read == MIDI_INPUT_QUEUE_CAPACITY) {
         atomic_fetch_add_explicit(&m->input_dropped, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&m->input_dropped_total, 1, memory_order_relaxed);
         return;
     }
 
@@ -190,6 +297,8 @@ static void *midi_out_thread(void *arg)
             continue;
         }
         if (r == -ENOSPC) {
+            atomic_fetch_add_explicit(&g_midi.seq_input_overruns, 1,
+                                      memory_order_relaxed);
             fprintf(stderr, "ns6d: ALSA MIDI input FIFO overran; events were lost\n");
             continue;
         }
@@ -279,7 +388,23 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--debug") == 0)
             ns6_debug_raw = 1;
+        else if (strcmp(argv[i], "--status") == 0)
+            return show_status();
+        else if (strcmp(argv[i], "--version") == 0) {
+#ifdef NS6D_VERSION
+            puts(NS6D_VERSION);
+#else
+            puts("unknown");
+#endif
+            return 0;
+        }
+        else if (strcmp(argv[i], "--help") == 0) {
+            puts("Usage: ns6d [--debug] | ns6d --status | ns6d --version");
+            return 0;
+        }
     }
+
+    g_started_ms = monotonic_ms();
 
     printf("ns6d — Numark NS6 ALSA MIDI/PipeWire audio daemon\n");
     if (ns6_debug_raw)
@@ -315,6 +440,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "ns6d: PipeWire audio unavailable; MIDI stays active and USB output is silent\n");
 
     printf("ns6d: running. Press Ctrl+C to stop.\n");
+    write_status();
     while (!g_quit) {
         pthread_t usb_thr, led_thr, midi_out_thr;
         bool usb_started = false, led_started = false, midi_out_started = false;
@@ -336,8 +462,10 @@ int main(int argc, char **argv)
             g_quit = true;
         }
 
-        while (!g_quit && !g_usb_failed)
+        while (!g_quit && !g_usb_failed) {
             sleep(1);
+            write_status();
+        }
 
         g_dev->running = false;
         if (g_dev->ctx) libusb_interrupt_event_handler(g_dev->ctx);
@@ -348,6 +476,7 @@ int main(int argc, char **argv)
         if (g_quit) break;
 
         fprintf(stderr, "ns6d: USB transport lost; reconnecting without replacing MIDI/PipeWire endpoints\n");
+        write_status();
         ns6_release_controls(g_dev);
         while (atomic_load_explicit(&g_midi.input_read, memory_order_relaxed) !=
                atomic_load_explicit(&g_midi.input_write, memory_order_acquire))
@@ -358,17 +487,22 @@ int main(int argc, char **argv)
         while (!g_quit) {
             if (ns6_reopen(g_dev) == 0 && ns6_init(g_dev) == 0) {
                 ns6_audio_reset(g_dev);
+                ++g_reconnects;
                 fprintf(stderr, "ns6d: NS6 reconnected; Mixxx MIDI subscription preserved\n");
+                write_status();
                 break;
             }
             fprintf(stderr, "ns6d: NS6 not ready; retrying in 1 second\n");
             sleep(1);
+            write_status();
         }
     }
 
     ns6_audio_stop(g_dev);
     ns6_close(g_dev);
     midi_close(&g_midi);
+    char path[512];
+    if (status_path(path, sizeof(path))) unlink(path);
     printf("ns6d: bye\n");
     return 0;
 }

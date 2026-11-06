@@ -52,10 +52,12 @@ on one Ubuntu notebook; broader stability and distribution testing remain.
 
 ## Build and installation
 
-Dependencies and setup steps are in the [daemon guide](daemon/README.md).
-For the Linux daemon, install the dependencies, build with CMake, install the
-systemd user service and udev rules, then select the NS6 sink/source in the
-audio application.
+Dependencies and setup steps are in the [daemon guide](daemon/README.md). The
+guide builds a Debian/Ubuntu `.deb` with CPack and installs the user service and
+udev rule. The package does not remove `snd-aloop`, old services, or ALSA
+configuration from prior experiments. Enable the user service once in the
+desktop session that runs PipeWire, then use `ns6d --status` and
+`journalctl --user -u ns6d` to inspect it.
 
 ## USB recovery design
 

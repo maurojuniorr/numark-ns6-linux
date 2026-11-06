@@ -1,0 +1,118 @@
+#!/usr/bin/python3
+import subprocess
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, GLib
+
+
+def read_status():
+    try:
+        result = subprocess.run(
+            ["ns6d", "--status"], capture_output=True, text=True, timeout=2
+        )
+        if result.returncode:
+            return {}
+        return dict(
+            line.split(": ", 1)
+            for line in result.stdout.splitlines()
+            if ": " in line
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+
+
+def value(text):
+    label = Gtk.Label(label=text, xalign=1)
+    label.set_selectable(True)
+    return label
+
+
+class StatusWindow(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="Numark NS6 Status")
+        self.set_border_width(24)
+        self.set_resizable(False)
+        self.set_default_size(430, 500)
+
+        layout = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        self.add(layout)
+
+        logo = Gtk.Label()
+        logo.set_markup('<span size="xx-large" weight="heavy">NUMARK</span>')
+        layout.pack_start(logo, False, False, 0)
+        title = Gtk.Label(label="NS6 Audio Driver")
+        title.get_style_context().add_class("dim-label")
+        layout.pack_start(title, False, False, 0)
+
+        grid = Gtk.Grid(column_spacing=18, row_spacing=10)
+        layout.pack_start(grid, True, True, 4)
+        self.values = {}
+        rows = (
+            ("Device", "device"),
+            ("Inputs", "inputs"),
+            ("Outputs", "outputs"),
+            ("Clock Rate", "clock"),
+            ("Word Length", "word"),
+            ("Driver Version", "version"),
+            ("Driver Developer", "developer"),
+            ("Firmware Version", "firmware"),
+        )
+        for row, (name, key) in enumerate(rows):
+            label = Gtk.Label(label=name, xalign=0)
+            label.set_hexpand(True)
+            grid.attach(label, 0, row, 1, 1)
+            self.values[key] = value("")
+            grid.attach(self.values[key], 1, row, 1, 1)
+
+        state_frame = Gtk.Frame()
+        layout.pack_end(state_frame, False, False, 0)
+        self.state = Gtk.Label(xalign=0.5, margin=12)
+        state_frame.add(self.state)
+        self.values["word"].set_text("24-bit packed")
+        self.values["version"].set_text(self.driver_version())
+        self.values["developer"].set_text("@maurojuniorr")
+        self.refresh()
+        GLib.timeout_add_seconds(1, self.refresh)
+
+    @staticmethod
+    def driver_version():
+        try:
+            return subprocess.run(
+                ["ns6d", "--version"], capture_output=True, text=True, timeout=2
+            ).stdout.strip() or "Unknown"
+        except (OSError, subprocess.TimeoutExpired):
+            return "Unknown"
+
+    def refresh(self):
+        status = read_status()
+        usb = status.get("USB", "")
+        self.values["device"].set_text("Numark NS6 (USB)" if usb == "connected" else "—")
+        self.values["firmware"].set_text(status.get("Firmware Version", "Unavailable"))
+        self.values["inputs"].set_text(
+            "2 channels · " + status.get("PipeWire input", "unavailable")
+        )
+        self.values["outputs"].set_text(
+            "4 channels · " + status.get("PipeWire output", "unavailable")
+        )
+        clock = status.get("USB clock feedback", "unavailable")
+        self.values["clock"].set_text("44.1 kHz · " + clock)
+
+        if usb == "connected":
+            ready = status.get("PipeWire output") != "unavailable"
+            color, message = ("#16823b", "CONNECTED — audio driver ready") if ready else (
+                "#b36b00", "CONNECTED — waiting for audio endpoints"
+            )
+        elif usb == "reconnecting":
+            color, message = "#b36b00", "RECONNECTING — waiting for Numark NS6"
+        else:
+            color, message = "#c62828", "NO DEVICE — driver not running"
+        self.state.set_markup(f'<span foreground="{color}">●  {message}</span>')
+        return GLib.SOURCE_CONTINUE
+
+
+window = StatusWindow()
+window.connect("destroy", Gtk.main_quit)
+window.show_all()
+Gtk.main()

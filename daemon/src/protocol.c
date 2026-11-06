@@ -37,17 +37,43 @@ static int ctrl_in(libusb_device_handle *usb,
 /* ------------------------------------------------------------------ */
 /* Passo 2 — Vendor capability query                                    */
 /* ------------------------------------------------------------------ */
-static int ns6_vendor_capability(libusb_device_handle *usb)
+static bool ns6_decode_firmware_version(const uint8_t response[8], size_t length,
+                                        char output[32])
 {
-    uint8_t buf[8];
-    const uint8_t expected[] = { 0x31, 0x01, 0x03, 0x02, 0x02 };
+    if (output) output[0] = '\0';
+    if (!response || !output || length < 3 || length > 8 ||
+        response[0] != 0x31 || response[1] == 0 || response[2] > 99)
+        return false;
 
-    /* Primeira leitura: descobre o tamanho */
+    /* Matches the Mac driver's decoder for the NS6's observed K1 response. */
+    unsigned major = response[1];
+    unsigned minor = response[2] / 10;
+    unsigned patch = response[2] % 10;
+    int written = snprintf(output, 32, "%u.%u.%u (K1)", major, minor, patch);
+    if (written < 0 || written >= 32) {
+        output[0] = '\0';
+        return false;
+    }
+    return true;
+}
+
+static int ns6_vendor_capability(ns6_device_t *dev)
+{
+    libusb_device_handle *usb = dev->usb;
+    uint8_t buf[8] = {0};
+    const uint8_t expected[] = { 0x31, 0x01, 0x03, 0x02, 0x02 };
+    dev->firmware_version[0] = '\0';
+
+    /* libusb returns the actual short-packet length for this five-byte reply. */
     int r = ctrl_in(usb, 0xC0, NS6_BREQ_VENDOR_CAP, 0, 0, buf, 8);
     if (r < 0) return r;
+    if (r < (int)sizeof(expected) || r > (int)sizeof(buf)) {
+        fprintf(stderr, "ns6: invalid capability response length: %d\n", r);
+        return LIBUSB_ERROR_IO;
+    }
 
-    /* Segunda leitura: lê com tamanho correto */
-    r = ctrl_in(usb, 0xC0, NS6_BREQ_VENDOR_CAP, 0, 0, buf, r);
+    int length = r;
+    r = ctrl_in(usb, 0xC0, NS6_BREQ_VENDOR_CAP, 0, 0, buf, (uint16_t)length);
     if (r < 0) return r;
 
     if (r < 5 || memcmp(buf, expected, 5) != 0) {
@@ -55,8 +81,14 @@ static int ns6_vendor_capability(libusb_device_handle *usb)
         return -1;
     }
 
-    printf("ns6: capability OK: %02x %02x %02x %02x %02x\n",
-           buf[0], buf[1], buf[2], buf[3], buf[4]);
+    printf("ns6: capability response (%d bytes):", r);
+    for (int i = 0; i < r; ++i)
+        printf(" %02x", buf[i]);
+    putchar('\n');
+    if (ns6_decode_firmware_version(buf, (size_t)r, dev->firmware_version))
+        printf("ns6: firmware version: %s\n", dev->firmware_version);
+    else
+        fprintf(stderr, "ns6: firmware response format is unsupported\n");
     return 0;
 }
 
@@ -252,7 +284,7 @@ int ns6_init(ns6_device_t *dev)
     }
 
     /* Passo 2 — Vendor capability query */
-    r = ns6_vendor_capability(usb);
+    r = ns6_vendor_capability(dev);
     if (r < 0) return r;
 
     /* Passo 3 — SET_INTERFACE 0 alt=1 */

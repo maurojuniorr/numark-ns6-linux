@@ -28,34 +28,48 @@ passa diretamente pelas filas do daemon; `snd-aloop` não é usado.
 ### Fedora
 
 ```bash
-sudo dnf install libusb1-devel alsa-lib-devel pipewire-devel cmake gcc pkg-config
+sudo dnf install libusb1-devel alsa-lib-devel pipewire-devel python3-gobject gtk3 cmake gcc pkg-config
 ```
 
 ### Debian/Ubuntu
 
 ```bash
-sudo apt install libusb-1.0-0-dev libasound2-dev libpipewire-0.3-dev cmake gcc pkg-config
+sudo apt install libusb-1.0-0-dev libasound2-dev libpipewire-0.3-dev python3-gi gir1.2-gtk-3.0 cmake gcc pkg-config dpkg-dev
 ```
 
 ## Build e instalação
 
 ```bash
-cmake -B build
-cmake --build build
-sudo cmake --install build
-sudo udevadm control --reload-rules
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+cd build && cpack -G DEB
+sudo apt install ./numark-ns6-driver_*.deb
 sudo udevadm trigger
+systemctl --user enable --now ns6d.service
 ```
 
-A instalação remove o serviço systemd antigo e os aliases ALSA do loopback
-instalados por versões anteriores. Ela tenta descarregar `snd-aloop` se nenhum
-outro processo o estiver usando. O serviço atual é um serviço **do usuário**;
-ative-o na sessão gráfica que executa PipeWire:
+O pacote instala `ns6d`, o serviço systemd do usuário e a regra udev. Ele não
+descarrega módulos nem remove serviços ou configuração ALSA de instalações
+anteriores. Se houver restos de uma versão antiga, remova-os manualmente depois
+de verificar que não estão em uso. O serviço é **do usuário** e deve ser ativado
+na sessão gráfica que executa PipeWire:
 
 ```bash
-systemctl --user daemon-reload
 systemctl --user enable --now ns6d
 ```
+
+Para remover, primeiro pare/desative o serviço na sessão do usuário e depois
+remova o pacote:
+
+```bash
+systemctl --user disable --now ns6d.service
+sudo apt remove numark-ns6-driver
+```
+
+O `.deb` é produzido para a arquitetura da máquina que executa CPack; gere-o
+separadamente em cada arquitetura alvo (por exemplo, `amd64` ou `arm64`).
+Em atualizações, o pacote recarrega a definição systemd na sessão de usuário
+ativa e reinicia `ns6d` se já estiver rodando.
 
 As regras udev dão acesso à NS6 e ao ALSA Sequencer ao usuário da sessão ativa.
 Se o dispositivo já estava conectado durante a instalação, desconecte e conecte
@@ -72,8 +86,20 @@ também pode usar a saída PipeWire da NS6.
 Confira os nós com `wpctl status`; MIDI com `aconnect -l` e logs com:
 
 ```bash
+ns6d --status
 journalctl --user -u ns6d -f
 ```
+
+O aplicativo **Numark NS6 Status** abre uma janela simples com conexão USB,
+entradas, saídas, clock, versões do driver e do firmware. A versão do firmware
+é lida pela consulta USB vendor `0x56` e decodificada como no driver macOS; se a
+controladora responder em um formato não reconhecido, o app mostra “Unavailable”.
+O app aparece no menu após instalar o pacote e atualiza o estado uma vez por segundo.
+
+`ns6d --status` mostra conexão/reconexão USB, cliente MIDI, streams PipeWire,
+estado do feedback do clock, ocupação da fila de saída e contadores acumulados
+de underrun, overrun e perda de frames. O snapshot é atualizado a cada segundo
+em `$XDG_RUNTIME_DIR/ns6d.status` e removido quando o daemon encerra normalmente.
 
 ## Estado
 

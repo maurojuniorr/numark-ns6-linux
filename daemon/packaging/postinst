@@ -1,0 +1,28 @@
+#!/bin/sh
+set -e
+
+if command -v udevadm >/dev/null 2>&1; then
+    udevadm control --reload-rules
+fi
+
+if command -v runuser >/dev/null 2>&1; then
+    for runtime_dir in /run/user/[0-9]*; do
+        [ -S "$runtime_dir/bus" ] || continue
+        uid=${runtime_dir##*/}
+        account=$(getent passwd "$uid" || true)
+        [ -n "$account" ] || continue
+        username=${account%%:*}
+        user_systemctl() {
+            runuser -u "$username" -- env \
+                XDG_RUNTIME_DIR="$runtime_dir" \
+                DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime_dir/bus" \
+                systemctl --user "$@"
+        }
+        user_systemctl daemon-reload >/dev/null 2>&1 || true
+        if user_systemctl --quiet is-active ns6d.service; then
+            user_systemctl restart ns6d.service >/dev/null 2>&1 || true
+        fi
+    done
+fi
+
+exit 0
