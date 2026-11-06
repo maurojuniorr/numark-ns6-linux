@@ -19,8 +19,9 @@ passa diretamente pelas filas do daemon; `snd-aloop` não é usado.
 - **Buffers:** filas SPSC isolam as callbacks USB e PipeWire de I/O bloqueante.
   A correção fracionária limitada acompanha a ocupação da fila de saída para
   compensar a deriva entre o relógio do host e o da NS6.
-- **MIDI:** mensagens packed de 42 bytes nos endpoints Bulk `0x83`/`0x04`,
-  expostas como cliente ALSA Sequencer **Numark NS6 MIDI Bridge**.
+- **MIDI:** relatórios de até 42 bytes no endpoint Bulk `0x83` são remontados
+  como fluxo MIDI contínuo antes de expor as mensagens pelo cliente ALSA
+  Sequencer **Numark NS6 MIDI Bridge**; saída pelo Bulk `0x04`.
 
 ## Dependências
 
@@ -58,8 +59,11 @@ systemctl --user enable --now ns6d
 
 As regras udev dão acesso à NS6 e ao ALSA Sequencer ao usuário da sessão ativa.
 Se o dispositivo já estava conectado durante a instalação, desconecte e conecte
-novamente o USB para aplicar a ACL. O daemon mantém o transporte USB ativo e
-reinicia após uma desconexão para recuperar a controladora.
+novamente o USB para aplicar a ACL. Em uma perda de USB, o daemon reabre o
+transporte e repete a inicialização sem recriar o cliente/porta MIDI ALSA ou os
+nós PipeWire. Em duas reconexões físicas de teste, áudio e MIDI voltaram sem
+fechar o Mixxx. A instalação de uma nova versão do daemon ainda recria a porta
+MIDI uma vez.
 
 No Mixxx, selecione **Numark USB Audio Device** e associe os canais 1–2 ao Main e
 3–4 aos fones. Para entrada, selecione **Numark USB Audio Device Input**. O áudio do sistema
@@ -76,11 +80,16 @@ journalctl --user -u ns6d -f
 - [x] Identificação USB e sequência de inicialização da NS6
 - [x] MIDI packed ↔ ALSA Sequencer, quatro decks e jog 14-bit
 - [x] Nó PipeWire de saída com 4 canais e source de entrada estéreo
+- [x] Captura USB `0x86` sob demanda: leituras iniciam com cliente PipeWire e pausam sem clientes, mantendo o MIDI ativo
 - [x] Feedback do clock USB e correção fracionária da fila de saída
-- [x] Recuperação do daemon após perda do transporte USB
-- [ ] Validar em hardware a reprodução simultânea, a captura e a latência no grafo PipeWire
-- [ ] Validar estabilidade prolongada e contadores de underrun/drop no hardware real
+- [x] Reconexão USB sem recriar a porta MIDI ALSA nem os nós PipeWire
+- [x] Testar duas reconexões USB com Mixxx aberto; áudio e MIDI retornaram sem reiniciar o Mixxx
+- [ ] Investigar um aviso de FIFO ALSA cheio observado durante a recuperação; não houve falha observada
+- [ ] Validar estabilidade prolongada, reprodução e captura simultâneas, latência e contadores de underrun/drop
 
 O caminho Linux é um daemon userspace, não um módulo de kernel. A validação de
 áudio simultâneo e da latência real depende do hardware e da sessão PipeWire
 usados.
+
+O resultado do teste físico de reconexão e a abordagem a investigar no macOS
+estão registrados em [`docs/usb-reconnection.md`](../docs/usb-reconnection.md).

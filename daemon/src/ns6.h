@@ -118,6 +118,9 @@ typedef struct {
 /* ------------------------------------------------------------------ */
 typedef struct {
     ns6_jog_t jog[4];
+    uint8_t   midi_message[3];
+    uint8_t   midi_message_used;
+    uint8_t   midi_message_expected;
     uint16_t  volume[4];
     uint16_t  eq_low[4];
     uint16_t  eq_mid[4];
@@ -161,23 +164,28 @@ struct ns6_device {
 ns6_device_t *ns6_open(void);
 int           ns6_init(ns6_device_t *dev);
 int           ns6_run(ns6_device_t *dev);
+int           ns6_reopen(ns6_device_t *dev);
 void          ns6_close(ns6_device_t *dev);
+void          ns6_release_controls(ns6_device_t *dev);
 
 int  ns6_send_midi(ns6_device_t *dev,
                    uint8_t status, uint8_t note, uint8_t value);
 int  ns6_send_ctrl_packet(ns6_device_t *dev,
                           const uint8_t packet[NS6_CTRL_PKT_SIZE]);
 void ns6_midi_out_wake(void);
+void ns6_midi_out_reset(void);
 void *ns6_midi_out_worker(void *arg);
 int ns6_audio_start(ns6_device_t *dev);
 void ns6_audio_stop(ns6_device_t *dev);
+void ns6_audio_reset(ns6_device_t *dev);
 size_t ns6_audio_output_queued(ns6_device_t *dev);
+bool ns6_audio_capture_requested(ns6_device_t *dev);
 void ns6_audio_output_read(ns6_device_t *dev, uint8_t *frames, size_t count,
                            double source_frames_per_output_frame);
 void ns6_audio_capture_usb_block(ns6_device_t *dev, const uint8_t *source,
                                  size_t source_bytes);
 
-void ns6_parse_packet(ns6_device_t *dev, const uint8_t *pkt);
+void ns6_parse_packet(ns6_device_t *dev, const uint8_t *pkt, size_t length);
 
 extern int ns6_debug_raw;
 

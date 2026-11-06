@@ -1,76 +1,66 @@
-# 🐧 Numark NS6 Native Linux Kernel Driver (`snd-ns6`)
+# Numark NS6 Linux Driver
 
-**Resurrecting a Legend: The first 99% functional native ALSA kernel driver for the Numark NS6.**
+This repository contains a Linux userspace driver for the Numark NS6. The
+current implementation is a C daemon (`ns6d`) using libusb for the controller,
+ALSA Sequencer for MIDI, and PipeWire for audio. It is not a kernel module and
+does not use `snd-aloop`.
 
-This project is a low-level engineering effort to bring the **Numark NS6** (VID 15e4, PID 0079) to the Linux ecosystem. Unlike simple MIDI mappings, this is a **C-coded Kernel Module** that interfaces directly with the ALSA architecture, aiming for professional-grade stability and ultra-low latency.
+The project aims to provide the NS6's audio interface and MIDI controls on
+Linux, including reliable audio capture from the controller's internal record
+mix and recovery after USB disconnects.
 
-> [!IMPORTANT]
-> **CURRENT STATUS: ALPHA (v0.99) — "The Final Mile"**
-> The driver is fully operational for both MIDI and Audio. Current development is focused on fine-tuning the adaptive rate controller to eliminate the final 1% of audio micro-glitches (clicks) caused by hardware crystal drift.
+## Current progress
 
----
+- **MIDI input and output:** the daemon parses the NS6's packed 42-byte USB
+  reports as a continuous MIDI stream, including 14-bit jog data, and exposes
+  an ALSA Sequencer port named **Numark USB Audio Device MIDI**. Mixxx controls
+  and LEDs have been exercised on the hardware.
+- **Audio output:** PipeWire publishes **Numark USB Audio Device** as a
+  four-channel, 44.1 kHz S24_3LE sink. Channels 1–2 feed Main; channels 3–4
+  feed the headphones.
+- **Audio input:** PipeWire publishes **Numark USB Audio Device Input** as a
+  stereo, 44.1 kHz S24_3LE source. The daemon decodes the NS6's packed Bulk IN
+  endpoint `0x86`; USB capture reads run only while a PipeWire input client is
+  active. The input path was corrected and a 440 Hz capture test was reported
+  clear.
+- **Clock and buffering:** the daemon reads the NS6 feedback endpoint `0x81`
+  and adjusts output packet cadence against the USB clock and output queue.
+  Bounded SPSC rings separate PipeWire processing from USB transfers.
+- **USB recovery:** after a disconnect, the daemon reopens the USB transport
+  and repeats the NS6 handshake while preserving its ALSA MIDI port and
+  PipeWire streams. In two hardware reconnects, Mixxx stayed open and the user
+  confirmed audio and MIDI returned normally without restarting it. See the
+  [reconnection test notes](docs/usb-reconnection.md).
 
-## 👨‍🏫 About the Author
-**Mauro Junior**
-* **Computer Science Professor** at **IFAM** (Federal Institute of Amazonas, Brazil).
-* **Professional DJ** & Linux Enthusiast.
-* **Programmer** dedicated to hardware reverse engineering and kernel development.
+This is an actively tested prototype. The latest hardware checks were performed
+on one Ubuntu notebook; broader stability and distribution testing remain.
 
----
+## Work remaining
 
-## 🔥 The Engineering Challenge (The "Final Boss")
+- Investigate one ALSA Sequencer input FIFO overrun warning observed during
+  reconnection. It caused no user-observed MIDI or audio failure, but its source
+  and effect on LED updates still need confirmation.
+- Run longer combined playback and capture sessions and record underrun/drop
+  counters under realistic load.
+- Verify LED initialization and state recovery after repeated USB disconnects,
+  including when multiple PipeWire clients are active.
+- Test clean installation, startup, suspend/resume, and reconnection on more
+  Linux distributions and hardware configurations.
+- Audit the macOS driver's USB/CoreAudio/CoreMIDI lifecycle, then evaluate
+  whether the same endpoint-preserving recovery approach can be used there. It
+  has not been implemented or validated on macOS.
 
-The NS6 was considered "Windows/Mac only" for 15 years due to its proprietary Ploytec chipset. This driver solves the core architectural hurdles that prevented official support:
+## Build and installation
 
-### 1. Anti-Drift Sync Engine
-The NS6 lacks a functional hardware feedback endpoint (EP 0x81 is a dummy returning constant `0xAAAAAA`). This causes a clock mismatch between the host and the hardware's internal crystal (~44101.5 Hz).
-* **The Solution:** We implemented a **Fractional Frame Accumulator** coupled with an **Adaptive PID Controller**.
-* The driver monitors the ALSA buffer fill level and dynamically adjusts the host consumption rate to converge with the hardware crystal.
+Dependencies and setup steps are in the [daemon guide](daemon/README.md).
+For the Linux daemon, install the dependencies, build with CMake, install the
+systemd user service and udev rules, then select the NS6 sink/source in the
+audio application.
 
-$$f_{adj} = K_p e(t) + K_i \int e(t) dt + K_d \frac{de(t)}{dt}$$
+## USB recovery design
 
-### 2. 42-Byte MIDI Protocol
-Unlike standard USB-MIDI, the NS6 uses fixed 42-byte packets with `0xFD` padding. Our driver implements a native parser that ensures no LED commands or high-resolution (14-bit) Jog movements are lost during performance.
-
----
-
-## ✅ Functional Features (Alpha 0.99)
-
-* **Pro Audio (ALSA PCM):** 4-channel output (Main + Headphones) at 24-bit (S24_3LE).
-* **Stable Isochronous Stream:** Packet management designed to keep the hardware clock "warm."
-* **Native Handshake:** Automated boot sequence (Activate Vendor Mode) and SysEx initialization handled at the kernel level.
-* **Endpoint Draining:** EP 0x86 (Waveform) is continuously drained to prevent USB bus stalls.
-
----
-
-## 🏗️ Technical Heritage
-This driver is built upon the foundational logic of the **Ozzy Project** by **Marcel Bierling (Ploytec)**. We are honoring that legacy by extending the logic to support the specific quirks of the NS6 hardware, such as the unique initialization sequence and `bReq=0xE0` vendor requests.
-
----
-
-## 🛠️ How to Help (Call for Developers)
-
-We are in the final stabilization phase. If you are an **ALSA developer**, a **USB timing expert**, or a **PID tuning wizard**, we need your help with:
-
-1.  **PID Calibration:** Fine-tuning the $K_p$, $K_i$, and $K_d$ parameters for smooth convergence across different CPU governors.
-2.  **The bReq=0xE0 Mystery:** Investigating xHCI limitations on Linux to replicate the proprietary Ploytec polling.
-3.  **Waveform Decoding:** Reverse engineering the EP 0x86 data protocol to enable the onboard LCD displays.
-
----
-
-## 📥 Fast Installation
-
-### Prerequisites (Fedora example)
-```bash
-sudo dnf install kernel-devel kernel-headers development-tools
-
-Bash
-git clone [https://github.com/maurojuniorr/numark-ns6-linux.git](https://github.com/maurojuniorr/numark-ns6-linux.git)
-cd numark-ns6-linux/kmod-total
-make clean && make
-sudo make install
-sudo modprobe snd-ns6
-```
-Developed with ❤️ by:
-Mauro Junior (@maurojuniorr) & Gemini (IA)
-Husband, Father, Programmer, Professor, Researcher, and DJ.
+The key recovery principle is to reopen the physical USB transport without
+destroying host-visible MIDI and audio endpoints. The daemon cancels and drains
+outstanding libusb transfers, resets queued audio and controller state, runs the
+NS6 initialization sequence again, then restarts its transport workers. This
+keeps Mixxx subscribed to the same ALSA port across an NS6 reconnect.

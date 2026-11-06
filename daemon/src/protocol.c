@@ -313,21 +313,69 @@ int ns6_init(ns6_device_t *dev)
     return 0;
 }
 
+void ns6_release_controls(ns6_device_t *dev)
+{
+    if (!dev || !dev->on_midi_in) return;
+    for (unsigned deck = 0; deck < 4; ++deck) {
+        uint8_t status = (uint8_t)(0x80 | (deck + 1));
+        if (dev->state.play[deck])
+            dev->on_midi_in(dev, status, NS6_NOTE_PLAY, 0);
+        if (dev->state.cue[deck])
+            dev->on_midi_in(dev, status, NS6_NOTE_CUE, 0);
+        if (dev->state.jog[deck].touch)
+            dev->on_midi_in(dev, status, NS6_NOTE_JOG_TOUCH, 0);
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* Parse de pacote MIDI de 42 bytes                                     */
 /* ------------------------------------------------------------------ */
 /* Liga/desliga debug de pacotes crus — útil pra mapear novos controles */
 int ns6_debug_raw = 0;
 
-void ns6_parse_packet(ns6_device_t *dev, const uint8_t *pkt)
+void ns6_parse_packet(ns6_device_t *dev, const uint8_t *pkt, size_t length)
 {
     ns6_state_t *st = &dev->state;
+    uint8_t messages[NS6_CTRL_PKT_SIZE];
+    size_t message_bytes = 0;
     int i = 0;
+
+    if (!pkt) return;
+    if (length > NS6_CTRL_PKT_SIZE) length = NS6_CTRL_PKT_SIZE;
+    if (length == NS6_CTRL_PKT_SIZE) --length;
+
+    /* Reports are fragments of a MIDI byte stream; keep partial messages. */
+    for (size_t j = 0; j < length; ++j) {
+        uint8_t byte = pkt[j];
+        if (byte == NS6_IDLE_BYTE) continue;
+        if (byte & 0x80) {
+            st->midi_message_used = 0;
+            st->midi_message_expected = 0;
+            if (byte <= 0xEF) {
+                st->midi_message[0] = byte;
+                st->midi_message_used = 1;
+                st->midi_message_expected =
+                        (byte >= 0xC0 && byte <= 0xDF) ? 2 : 3;
+            }
+            continue;
+        }
+        if (!st->midi_message_expected || st->midi_message_used >= 3)
+            continue;
+        st->midi_message[st->midi_message_used++] = byte;
+        if (st->midi_message_used == st->midi_message_expected) {
+            if (st->midi_message_expected == 3) {
+                memcpy(messages + message_bytes, st->midi_message, 3);
+                message_bytes += 3;
+            }
+            st->midi_message_used = 0;
+            st->midi_message_expected = 0;
+        }
+    }
 
     /* Debug: mostra pacote cru completo quando há dados não-idle */
     if (ns6_debug_raw) {
         bool has_data = false;
-        for (int j = 0; j < NS6_CTRL_PKT_SIZE - 1; j++) {
+        for (size_t j = 0; j < length; ++j) {
             if (pkt[j] != NS6_IDLE_BYTE && pkt[j] != NS6_PKT_TERMINATOR) {
                 has_data = true;
                 break;
@@ -335,35 +383,15 @@ void ns6_parse_packet(ns6_device_t *dev, const uint8_t *pkt)
         }
         if (has_data) {
             printf("RAW [");
-            for (int j = 0; j < NS6_CTRL_PKT_SIZE - 1; j += 3) {
-                uint8_t s = pkt[j], n = pkt[j+1], v = pkt[j+2];
-                if (s == NS6_IDLE_BYTE) break;
-                printf(" %02x %02x %02x |", s, n, v);
-            }
+            for (size_t j = 0; j < length; ++j) printf(" %02x", pkt[j]);
             printf(" ]\n");
         }
     }
 
-    while (i < NS6_CTRL_PKT_SIZE - 3) {
-        uint8_t status = pkt[i];
-        uint8_t note   = pkt[i + 1];
-        uint8_t value  = pkt[i + 2];
-
-        /* Fim do pacote */
-        if (status == NS6_PKT_TERMINATOR)
-            break;
-
-        /* Slot vazio */
-        if (status == NS6_IDLE_BYTE) {
-            i += 3;
-            continue;
-        }
-
-        /* Byte de status inválido — slot corrompido, pula */
-        if (!(status & 0x80)) {
-            i += 3;
-            continue;
-        }
+    while ((size_t)i < message_bytes) {
+        uint8_t status = messages[i];
+        uint8_t note   = messages[i + 1];
+        uint8_t value  = messages[i + 2];
 
         uint8_t msg = status & 0xF0;
         uint8_t ch  = status & 0x0F;

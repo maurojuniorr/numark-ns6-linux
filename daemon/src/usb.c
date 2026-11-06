@@ -14,6 +14,7 @@ enum { NS6_FEEDBACK_PACKETS = 32, NS6_FEEDBACK_MAX_PACKET = 64,
 typedef struct {
     ns6_device_t *dev;
     struct libusb_transfer *transfer;
+    bool submitted;
     unsigned millisecond_frames[8];
 } ns6_iso_slot_t;
 
@@ -24,6 +25,7 @@ typedef struct {
     uint64_t sequence;
     size_t actual_length;
     bool completed;
+    bool submitted;
 } ns6_capture_slot_t;
 
 /* ------------------------------------------------------------------ */
@@ -32,6 +34,7 @@ typedef struct {
 typedef struct {
     /* Bulk IN transfers (EP 0x83) — controle MIDI */
     struct libusb_transfer *ctrl_in_xfer[4];
+    bool ctrl_in_submitted[4];
     uint8_t ctrl_in_buf[4][NS6_CTRL_PKT_SIZE];
 
     /* Capture IN (EP 0x86) — packed stereo PCM → PipeWire source ring. */
@@ -40,6 +43,7 @@ typedef struct {
     uint64_t capture_next_process;
 
     struct libusb_transfer *feedback_xfer[NS6_FEEDBACK_SLOTS];
+    bool feedback_submitted[NS6_FEEDBACK_SLOTS];
     uint8_t feedback_buf[NS6_FEEDBACK_SLOTS][NS6_FEEDBACK_PACKETS * NS6_FEEDBACK_MAX_PACKET];
     unsigned feedback_packet_bytes;
     ns6_clock_control_t clock;
@@ -64,13 +68,15 @@ static void mark_transport_lost(ns6_device_t *dev, const char *operation,
 
 static void LIBUSB_CALL feedback_in_cb(struct libusb_transfer *xfer) {
     ns6_device_t *dev = xfer->user_data;
+    ns6_usb_priv_t *priv = dev->priv;
+    if (!priv) return;
+    for (int i = 0; i < NS6_FEEDBACK_SLOTS; ++i)
+        if (priv->feedback_xfer[i] == xfer) priv->feedback_submitted[i] = false;
     if (xfer->status == LIBUSB_TRANSFER_NO_DEVICE) {
         mark_transport_lost(dev, "feedback IN", LIBUSB_ERROR_NO_DEVICE);
         return;
     }
     if (!dev->running || xfer->status == LIBUSB_TRANSFER_CANCELLED) return;
-    ns6_usb_priv_t *priv = dev->priv;
-    if (!priv) return;
     if (xfer->status == LIBUSB_TRANSFER_COMPLETED) {
         uint64_t now_ms = monotonic_ms();
         for (int i = 0; i < xfer->num_iso_packets; ++i) {
@@ -90,6 +96,9 @@ static void LIBUSB_CALL feedback_in_cb(struct libusb_transfer *xfer) {
     if (r < 0) {
         fprintf(stderr, "ns6: feedback IN resubmit: %s\n", libusb_strerror(r));
         mark_transport_lost(dev, "feedback IN resubmit", r);
+    } else {
+        for (int i = 0; i < NS6_FEEDBACK_SLOTS; ++i)
+            if (priv->feedback_xfer[i] == xfer) priv->feedback_submitted[i] = true;
     }
 }
 
@@ -99,10 +108,13 @@ static void LIBUSB_CALL feedback_in_cb(struct libusb_transfer *xfer) {
 static void LIBUSB_CALL ctrl_in_cb(struct libusb_transfer *xfer)
 {
     ns6_device_t *dev = (ns6_device_t *)xfer->user_data;
+    ns6_usb_priv_t *priv = dev->priv;
+    if (!priv) return;
+    for (int i = 0; i < 4; ++i)
+        if (priv->ctrl_in_xfer[i] == xfer) priv->ctrl_in_submitted[i] = false;
 
-    if (xfer->status == LIBUSB_TRANSFER_COMPLETED &&
-        xfer->actual_length == NS6_CTRL_PKT_SIZE) {
-        ns6_parse_packet(dev, xfer->buffer);
+    if (xfer->status == LIBUSB_TRANSFER_COMPLETED && xfer->actual_length > 0) {
+        ns6_parse_packet(dev, xfer->buffer, (size_t)xfer->actual_length);
     } else if (xfer->status == LIBUSB_TRANSFER_NO_DEVICE) {
         mark_transport_lost(dev, "MIDI IN", LIBUSB_ERROR_NO_DEVICE);
     } else if (xfer->status != LIBUSB_TRANSFER_CANCELLED) {
@@ -113,6 +125,10 @@ static void LIBUSB_CALL ctrl_in_cb(struct libusb_transfer *xfer)
     if (dev->running) {
         int r = libusb_submit_transfer(xfer);
         if (r < 0) mark_transport_lost(dev, "MIDI IN resubmit", r);
+        else {
+            for (int i = 0; i < 4; ++i)
+                if (priv->ctrl_in_xfer[i] == xfer) priv->ctrl_in_submitted[i] = true;
+        }
     }
 }
 
@@ -125,12 +141,16 @@ static void LIBUSB_CALL capture_in_cb(struct libusb_transfer *xfer)
     ns6_device_t *dev = slot->dev;
     ns6_usb_priv_t *priv = dev->priv;
     if (!priv) return;
+    slot->submitted = false;
 
     if (xfer->status == LIBUSB_TRANSFER_NO_DEVICE) {
         mark_transport_lost(dev, "capture IN", LIBUSB_ERROR_NO_DEVICE);
         return;
     }
-    if (xfer->status == LIBUSB_TRANSFER_CANCELLED) return;
+    if (xfer->status == LIBUSB_TRANSFER_CANCELLED) {
+        slot->completed = false;
+        return;
+    }
     if (xfer->status != LIBUSB_TRANSFER_COMPLETED) {
         fprintf(stderr, "ns6: capture_in status=%d\n", xfer->status);
     }
@@ -149,12 +169,14 @@ static void LIBUSB_CALL capture_in_cb(struct libusb_transfer *xfer)
         }
         if (!ready) break;
 
-        if (ready->actual_length > 0)
+        bool capture_requested = ns6_audio_capture_requested(dev);
+        if (capture_requested && ready->actual_length > 0)
             ns6_audio_capture_usb_block(dev, ready->buffer,
                                         ready->actual_length);
         ready->completed = false;
         ready->sequence = priv->capture_next_submit++;
         ++priv->capture_next_process;
+        if (!capture_requested) continue;
         int r = libusb_submit_transfer(ready->transfer);
         if (r < 0) {
             fprintf(stderr, "ns6: capture IN resubmit: %s\n", libusb_strerror(r));
@@ -162,7 +184,53 @@ static void LIBUSB_CALL capture_in_cb(struct libusb_transfer *xfer)
             dev->running = false;
             break;
         }
+        ready->submitted = true;
     }
+}
+
+static bool capture_reads_pending(const ns6_usb_priv_t *priv)
+{
+    for (size_t i = 0; i < NS6_CAPTURE_READ_SLOTS; ++i)
+        if (priv->capture[i].submitted) return true;
+    return false;
+}
+
+static int start_capture_reads(ns6_device_t *dev, ns6_usb_priv_t *priv)
+{
+    if (capture_reads_pending(priv)) return 0;
+
+    priv->capture_next_process = 0;
+    priv->capture_next_submit = NS6_CAPTURE_READ_SLOTS;
+    for (size_t i = 0; i < NS6_CAPTURE_READ_SLOTS; ++i) {
+        ns6_capture_slot_t *slot = &priv->capture[i];
+        slot->sequence = i;
+        slot->completed = false;
+        libusb_fill_bulk_transfer(slot->transfer, dev->usb, NS6_EP_CAPTURE,
+                slot->buffer, NS6_CAPTURE_READ_SIZE, capture_in_cb, slot, 0);
+        int r = libusb_submit_transfer(slot->transfer);
+        if (r < 0) {
+            fprintf(stderr, "ns6: capture IN submit[%zu]: %s\n",
+                    i, libusb_strerror(r));
+            return r;
+        }
+        slot->submitted = true;
+    }
+    fprintf(stderr, "ns6: capture input active (%d ordered USB reads queued)\n",
+            NS6_CAPTURE_READ_SLOTS);
+    return 0;
+}
+
+static void stop_capture_reads(ns6_usb_priv_t *priv)
+{
+    for (size_t i = 0; i < NS6_CAPTURE_READ_SLOTS; ++i) {
+        ns6_capture_slot_t *slot = &priv->capture[i];
+        if (!slot->submitted) continue;
+        int r = libusb_cancel_transfer(slot->transfer);
+        if (r < 0 && r != LIBUSB_ERROR_NOT_FOUND)
+            fprintf(stderr, "ns6: capture IN cancel[%zu]: %s\n",
+                    i, libusb_strerror(r));
+    }
+    fprintf(stderr, "ns6: capture input paused (no PipeWire clients)\n");
 }
 
 /* ------------------------------------------------------------------ */
@@ -171,6 +239,7 @@ static void LIBUSB_CALL capture_in_cb(struct libusb_transfer *xfer)
 static void LIBUSB_CALL audio_out_cb(struct libusb_transfer *xfer)
 {
     ns6_iso_slot_t *slot = (ns6_iso_slot_t *)xfer->user_data;
+    slot->submitted = false;
     if (xfer->status == LIBUSB_TRANSFER_NO_DEVICE) {
         mark_transport_lost(slot->dev, "ISO output", LIBUSB_ERROR_NO_DEVICE);
         return;
@@ -206,6 +275,8 @@ static void LIBUSB_CALL audio_out_cb(struct libusb_transfer *xfer)
     if (r < 0) {
         fprintf(stderr, "ns6: ISO output resubmit: %s\n", libusb_strerror(r));
         mark_transport_lost(slot->dev, "ISO output resubmit", r);
+    } else {
+        slot->submitted = true;
     }
 }
 
@@ -256,6 +327,8 @@ static void start_feedback_reads(ns6_device_t *dev, ns6_usb_priv_t *priv) {
             libusb_free_transfer(xfer);
             priv->feedback_xfer[i] = NULL;
             break;
+        } else {
+            priv->feedback_submitted[i] = true;
         }
     }
     if (priv->feedback_xfer[0])
@@ -294,6 +367,14 @@ static int out_queue_push(const uint8_t packet[NS6_CTRL_PKT_SIZE])
     }
     pthread_mutex_unlock(&out_queue_mutex);
     return result;
+}
+
+void ns6_midi_out_reset(void)
+{
+    pthread_mutex_lock(&out_queue_mutex);
+    out_queue_head = out_queue_tail = 0;
+    out_queue_overflow_reported = false;
+    pthread_mutex_unlock(&out_queue_mutex);
 }
 
 void ns6_midi_out_wake(void)
@@ -378,26 +459,16 @@ int ns6_run(ns6_device_t *dev)
                     i, libusb_strerror(r));
             goto fail;
         }
+        priv->ctrl_in_submitted[i] = true;
     }
 
-    /* Keep ordered reads queued so the bulk endpoint never waits on one callback. */
+    /* Allocate capture transfers; PipeWire demand decides when to submit them. */
     for (size_t i = 0; i < NS6_CAPTURE_READ_SLOTS; ++i) {
         ns6_capture_slot_t *slot = &priv->capture[i];
         slot->dev = dev;
         slot->transfer = libusb_alloc_transfer(0);
         if (!slot->transfer) goto fail;
-        slot->sequence = priv->capture_next_submit++;
-        libusb_fill_bulk_transfer(slot->transfer, dev->usb, NS6_EP_CAPTURE,
-                slot->buffer, NS6_CAPTURE_READ_SIZE, capture_in_cb, slot, 0);
-        int r = libusb_submit_transfer(slot->transfer);
-        if (r < 0) {
-            fprintf(stderr, "ns6: capture IN submit[%zu]: %s\n",
-                    i, libusb_strerror(r));
-            goto fail;
-        }
     }
-    printf("ns6: capture input active (%d ordered USB reads queued)\n",
-           NS6_CAPTURE_READ_SLOTS);
 
     /* The device's feedback stream is the clock reference for ISO OUT. */
     start_feedback_reads(dev, priv);
@@ -418,7 +489,23 @@ int ns6_run(ns6_device_t *dev)
 
     printf("ns6: all transfers running\n");
 
+    bool capture_reads_active = false;
     while (dev->running) {
+        bool capture_requested = ns6_audio_capture_requested(dev);
+        if (capture_requested && !capture_reads_active &&
+            !capture_reads_pending(priv)) {
+            int capture_result = start_capture_reads(dev, priv);
+            if (capture_result < 0) {
+                if (capture_result == LIBUSB_ERROR_NO_DEVICE)
+                    mark_transport_lost(dev, "capture IN submit", capture_result);
+                dev->running = false;
+                return -1;
+            }
+            capture_reads_active = true;
+        } else if (!capture_requested && capture_reads_active) {
+            stop_capture_reads(priv);
+            capture_reads_active = false;
+        }
         struct timeval tv = { 0, 10000 };
         int r = libusb_handle_events_timeout_completed(dev->ctx, &tv, NULL);
         if (r < 0 && r != LIBUSB_ERROR_INTERRUPTED) {
@@ -431,8 +518,6 @@ int ns6_run(ns6_device_t *dev)
 
 fail:
     dev->running = false;
-    free(priv);
-    dev->priv = NULL;
     return -1;
 }
 
@@ -467,37 +552,110 @@ ns6_device_t *ns6_open(void)
     return dev;
 }
 
+static bool transfers_pending(const ns6_usb_priv_t *priv)
+{
+    for (int i = 0; i < 4; ++i)
+        if (priv->ctrl_in_submitted[i]) return true;
+    for (int i = 0; i < NS6_FEEDBACK_SLOTS; ++i)
+        if (priv->feedback_submitted[i]) return true;
+    for (int i = 0; i < 2; ++i)
+        if (priv->iso_out[i].submitted) return true;
+    return capture_reads_pending(priv);
+}
+
+static void cancel_transfer(struct libusb_transfer *xfer, bool submitted)
+{
+    if (!xfer || !submitted) return;
+    int r = libusb_cancel_transfer(xfer);
+    if (r < 0 && r != LIBUSB_ERROR_NOT_FOUND && r != LIBUSB_ERROR_NO_DEVICE)
+        fprintf(stderr, "ns6: transfer cancel: %s\n", libusb_strerror(r));
+}
+
+static void free_transfers(ns6_usb_priv_t *priv)
+{
+    for (int i = 0; i < 4; ++i)
+        if (priv->ctrl_in_xfer[i]) libusb_free_transfer(priv->ctrl_in_xfer[i]);
+    for (size_t i = 0; i < NS6_CAPTURE_READ_SLOTS; ++i)
+        if (priv->capture[i].transfer) libusb_free_transfer(priv->capture[i].transfer);
+    for (int i = 0; i < 2; ++i) {
+        struct libusb_transfer *xfer = priv->iso_out[i].transfer;
+        if (xfer) {
+            free(xfer->buffer);
+            libusb_free_transfer(xfer);
+        }
+    }
+    for (int i = 0; i < NS6_FEEDBACK_SLOTS; ++i)
+        if (priv->feedback_xfer[i]) libusb_free_transfer(priv->feedback_xfer[i]);
+    free(priv);
+}
+
+static void close_usb_transport(ns6_device_t *dev)
+{
+    if (!dev) return;
+    dev->running = false;
+    ns6_usb_priv_t *priv = dev->priv;
+    if (priv) {
+        for (int i = 0; i < 4; ++i)
+            cancel_transfer(priv->ctrl_in_xfer[i], priv->ctrl_in_submitted[i]);
+        for (size_t i = 0; i < NS6_CAPTURE_READ_SLOTS; ++i)
+            cancel_transfer(priv->capture[i].transfer, priv->capture[i].submitted);
+        for (int i = 0; i < 2; ++i)
+            cancel_transfer(priv->iso_out[i].transfer, priv->iso_out[i].submitted);
+        for (int i = 0; i < NS6_FEEDBACK_SLOTS; ++i)
+            cancel_transfer(priv->feedback_xfer[i], priv->feedback_submitted[i]);
+
+        while (transfers_pending(priv)) {
+            struct timeval timeout = { 0, 10000 };
+            int r = libusb_handle_events_timeout_completed(dev->ctx, &timeout, NULL);
+            if (r < 0 && r != LIBUSB_ERROR_INTERRUPTED)
+                fprintf(stderr, "ns6: draining cancelled USB transfers: %s\n",
+                        libusb_strerror(r));
+        }
+        dev->priv = NULL;
+        free_transfers(priv);
+    }
+
+    if (dev->usb) {
+        libusb_release_interface(dev->usb, 1);
+        libusb_release_interface(dev->usb, 0);
+        libusb_close(dev->usb);
+        dev->usb = NULL;
+    }
+    if (dev->ctx) {
+        libusb_exit(dev->ctx);
+        dev->ctx = NULL;
+    }
+}
+
+int ns6_reopen(ns6_device_t *dev)
+{
+    if (!dev) return -1;
+    close_usb_transport(dev);
+    memset(&dev->state, 0, sizeof(dev->state));
+    dev->transport_lost = false;
+    int r = libusb_init(&dev->ctx);
+    if (r < 0) {
+        fprintf(stderr, "ns6: libusb_init during reconnect: %s\n", libusb_strerror(r));
+        dev->ctx = NULL;
+        return r;
+    }
+    dev->usb = libusb_open_device_with_vid_pid(dev->ctx,
+            NS6_VENDOR_ID, NS6_PRODUCT_ID);
+    if (!dev->usb) {
+        fprintf(stderr, "ns6: waiting for NS6 USB device\n");
+        libusb_exit(dev->ctx);
+        dev->ctx = NULL;
+        return LIBUSB_ERROR_NO_DEVICE;
+    }
+    libusb_set_auto_detach_kernel_driver(dev->usb, 1);
+    printf("ns6: USB transport reopened\n");
+    return 0;
+}
+
 void ns6_close(ns6_device_t *dev)
 {
     if (!dev) return;
-
-    dev->running = false;
-
-    ns6_usb_priv_t *priv = dev->priv;
-    if (priv) {
-        for (int i = 0; i < 4; i++) {
-            if (priv->ctrl_in_xfer[i])
-                libusb_cancel_transfer(priv->ctrl_in_xfer[i]);
-        }
-        for (size_t i = 0; i < NS6_CAPTURE_READ_SLOTS; ++i) {
-            if (priv->capture[i].transfer)
-                libusb_cancel_transfer(priv->capture[i].transfer);
-        }
-        for (int i = 0; i < 2; ++i) {
-            if (priv->iso_out[i].transfer)
-                libusb_cancel_transfer(priv->iso_out[i].transfer);
-        }
-        for (int i = 0; i < NS6_FEEDBACK_SLOTS; ++i) {
-            if (priv->feedback_xfer[i])
-                libusb_cancel_transfer(priv->feedback_xfer[i]);
-        }
-        free(priv);
-    }
-
-    libusb_release_interface(dev->usb, 1);
-    libusb_release_interface(dev->usb, 0);
-    libusb_close(dev->usb);
-    libusb_exit(dev->ctx);
+    close_usb_transport(dev);
     free(dev);
     printf("ns6: closed\n");
 }

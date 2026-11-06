@@ -9,3 +9,5 @@
 *.symvers
 *.order
 .tmp_versions/
+/daemon/build/
+/daemon/mixxx_debug.log

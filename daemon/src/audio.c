@@ -37,6 +37,8 @@ struct ns6_audio {
     atomic_uint_fast64_t output_underruns;
     atomic_uint_fast64_t input_drops;
     atomic_uint_fast64_t input_underruns;
+    atomic_bool input_active;
+    atomic_bool input_reprime;
     ns6_audio_ring_t output_ring;
     ns6_audio_ring_t input_ring;
     double output_phase;
@@ -51,6 +53,14 @@ static void stream_state_changed(void *userdata, enum pw_stream_state old_state,
                                  enum pw_stream_state state, const char *error) {
     (void)old_state;
     ns6_pw_stream_t *endpoint = userdata;
+    if (endpoint == &endpoint->audio->input) {
+        bool active = state == PW_STREAM_STATE_STREAMING;
+        atomic_store_explicit(&endpoint->audio->input_active, active,
+                              memory_order_release);
+        if (active)
+            atomic_store_explicit(&endpoint->audio->input_reprime, true,
+                                  memory_order_release);
+    }
     if (state == PW_STREAM_STATE_ERROR)
         fprintf(stderr, "ns6: PipeWire %s: %s\n", endpoint->label,
                 error ? error : "stream error");
@@ -95,6 +105,14 @@ static void input_process(void *userdata) {
         if (pw_buffer->requested > 0 && pw_buffer->requested < frame_count)
             frame_count = pw_buffer->requested;
         ns6_audio_ring_t *ring = &audio->input_ring;
+        if (atomic_exchange_explicit(&audio->input_reprime, false,
+                                     memory_order_acq_rel)) {
+            size_t newest = atomic_load_explicit(&ring->write_index,
+                                                  memory_order_acquire);
+            atomic_store_explicit(&ring->read_index, newest,
+                                  memory_order_release);
+            audio->input_primed = false;
+        }
         size_t read = atomic_load_explicit(&ring->read_index, memory_order_relaxed);
         size_t write = atomic_load_explicit(&ring->write_index, memory_order_acquire);
         size_t available = write - read;
@@ -215,6 +233,8 @@ int ns6_audio_start(ns6_device_t *dev) {
     atomic_init(&audio->output_underruns, 0);
     atomic_init(&audio->input_drops, 0);
     atomic_init(&audio->input_underruns, 0);
+    atomic_init(&audio->input_active, false);
+    atomic_init(&audio->input_reprime, false);
 
     int argc = 1;
     char arg0[] = "ns6d";
@@ -242,7 +262,7 @@ int ns6_audio_start(ns6_device_t *dev) {
             output_positions, &output_events);
     struct pw_stream *input = create_stream(audio, &audio->input,
             "numark_ns6_input", "Numark USB Audio Device Input", "Audio/Source",
-            "Capture", true, PW_DIRECTION_OUTPUT, NS6_INPUT_CHANNELS,
+            "Capture", false, PW_DIRECTION_OUTPUT, NS6_INPUT_CHANNELS,
             input_positions, &input_events);
     pw_thread_loop_unlock(audio->loop);
     if (!output || !input) {
@@ -264,6 +284,27 @@ size_t ns6_audio_output_queued(ns6_device_t *dev) {
     size_t write = atomic_load_explicit(&audio->output_ring.write_index,
                                         memory_order_acquire);
     return write - read;
+}
+
+void ns6_audio_reset(ns6_device_t *dev) {
+    ns6_audio_t *audio = dev ? dev->audio_priv : NULL;
+    if (!audio) return;
+    pw_thread_loop_lock(audio->loop);
+    atomic_store_explicit(&audio->output_ring.read_index, 0, memory_order_relaxed);
+    atomic_store_explicit(&audio->output_ring.write_index, 0, memory_order_relaxed);
+    atomic_store_explicit(&audio->input_ring.read_index, 0, memory_order_relaxed);
+    atomic_store_explicit(&audio->input_ring.write_index, 0, memory_order_relaxed);
+    audio->output_phase = 0.0;
+    audio->input_primed = false;
+    memset(&audio->capture_decoder, 0, sizeof(audio->capture_decoder));
+    atomic_store_explicit(&audio->input_reprime, true, memory_order_release);
+    pw_thread_loop_unlock(audio->loop);
+}
+
+bool ns6_audio_capture_requested(ns6_device_t *dev) {
+    ns6_audio_t *audio = dev ? dev->audio_priv : NULL;
+    return audio && atomic_load_explicit(&audio->input_active,
+                                         memory_order_acquire);
 }
 
 static int32_t unpack_pcm24(const uint8_t *sample) {
